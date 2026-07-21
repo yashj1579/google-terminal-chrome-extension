@@ -6,6 +6,11 @@
   "chrome_url_overrides": {
     "newtab": "newtab.html"
   },
+  "icons": {
+    "16": "assets/custom_google_favicon.png",
+    "48": "assets/custom_google_favicon.png",
+    "128": "assets/custom_google_favicon.png"
+  },
   "permissions": [
     "geolocation"
   ],
