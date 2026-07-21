@@ -329,7 +329,7 @@
           var lg = Math.round((a.cg + b.cg) / 2);
           var lb = Math.round((a.cb + b.cb) / 2);
           ctx.strokeStyle = 'rgba(' + lr + ',' + lg + ',' + lb + ',' + linkAlpha + ')';
-          ctx.lineWidth = 1.85;
+          ctx.lineWidth = 2.5;
           ctx.beginPath();
           ctx.moveTo(a.x, a.y);
           ctx.lineTo(b.x, b.y);

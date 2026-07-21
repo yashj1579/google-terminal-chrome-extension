@@ -2780,7 +2780,44 @@
   });
 
   initPosition();
-  if (input) input.focus();
+  function focusTerminalInput() {
+    if (!input) return;
+    var active = document.activeElement;
+    if (active && active !== input && active !== document.body && active !== document.documentElement) {
+      if (active.closest && active.closest('.popup-wrapper, .popup-window, [contenteditable="true"]')) {
+        return;
+      }
+      if (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT' || active.isContentEditable) {
+        return;
+      }
+    }
+    try {
+      input.focus({ preventScroll: true });
+    } catch (e) {
+      input.focus();
+    }
+  }
+
+  focusTerminalInput();
+  window.addEventListener('focus', focusTerminalInput);
+  window.addEventListener('pageshow', focusTerminalInput);
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) focusTerminalInput();
+  });
+  var focusTries = 0;
+  var focusTimer = setInterval(function() {
+    focusTerminalInput();
+    if (++focusTries >= 40) clearInterval(focusTimer);
+  }, 50);
+
+  document.addEventListener('mousedown', function(e) {
+    if (!input) return;
+    if (e.target.closest && e.target.closest('.popup-wrapper, .popup-window, a, button, input, textarea, select, [contenteditable="true"]')) {
+      return;
+    }
+    setTimeout(focusTerminalInput, 0);
+  });
+
   window.addEventListener('resize', function() {
     var r = wrapper.getBoundingClientRect();
     if (r.left + r.width > window.innerWidth || r.top + r.height > window.innerHeight) {
