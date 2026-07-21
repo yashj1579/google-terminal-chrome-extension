@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "New Tab",
+  "version": "1.1.0",
+  "description": "Custom terminal new-tab page (particles, shortcuts, weather, calculator, …)",
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
+  },
+  "permissions": [
+    "geolocation"
+  ],
+  "host_permissions": [
+    "https://api.open-meteo.com/*",
+    "https://api.ipify.org/*",
+    "https://*.tile.openstreetmap.org/*"
+  ]
+}

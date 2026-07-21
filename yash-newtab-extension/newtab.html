@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en" class="js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>New Tab</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{margin:0;padding:0;height:100%;width:100%;background:#1a1a1a}
+    .google-page-full{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;background:#1a1a1a}
+    .google-particle-canvas{position:absolute;top:0;left:0;width:100%;height:100%;display:block;pointer-events:none;z-index:0}
+    .terminal-drag-wrapper{position:fixed;z-index:1000;left:50%;top:50%;transform:translate(-50%,-50%)}
+    .terminal-window{width:820px;height:380px;margin:0;flex-shrink:0;background:#4a4a4a;border-radius:10px 10px 0 0;box-shadow:0 2px 16px rgba(0,0,0,.4);border:1px solid #1a1a1a;overflow:hidden;display:flex;flex-direction:column;position:relative}
+    .terminal-titlebar{cursor:move;user-select:none;background:#3a3a3a;color:#b0b0b0;font-family:'SF Mono',Consolas,Monaco,Inconsolata,monospace;font-size:13px;padding:10px 14px;border-bottom:1px solid #2a2a2a;text-align:center;flex-shrink:0}
+    .terminal-search{background:#4a4a4a;padding:16px 20px 20px 6px;flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:flex-start;min-height:0}
+    .terminal-output{flex:1;min-height:0;width:100%;overflow-y:auto;overflow-x:hidden;margin-bottom:8px;align-self:flex-start}
+    .terminal-output-line{font-family:'SF Mono',Consolas,Monaco,Inconsolata,monospace;font-size:13px;color:#b0b0b0;padding:2px 0;white-space:pre-wrap;word-break:break-all}
+    .terminal-output-result{color:#e0e0e0;padding-left:0}
+    .terminal-resize-handle{position:absolute;right:0;bottom:0;width:20px;height:20px;cursor:nwse-resize;z-index:10}
+    .terminal-resize-handle::after{content:'';position:absolute;right:6px;bottom:6px;width:10px;height:10px;border-right:2px solid #666;border-bottom:2px solid #666}
+    .terminal-form{display:flex;align-items:baseline;width:100%;max-width:100%;gap:0;background:transparent;align-self:flex-end}
+    .terminal-form-row{flex-shrink:0;position:relative;width:100%;margin-top:10px;margin-left:-8px}
+    .terminal-tab-options{display:none;position:absolute;top:100%;left:0;right:0;margin-top:-4px;margin-bottom:0;padding-left:24px;list-style:none;width:100%;flex-direction:row;flex-wrap:wrap;gap:0 2em;background:#4a4a4a;z-index:2}
+    .terminal-tab-options.terminal-tab-options-visible{display:flex!important}
+    .terminal-tab-option{font-family:'SF Mono',Consolas,Monaco,Inconsolata,monospace;font-size:13px;color:#888;padding:2px 0}
+    .terminal-prompt{color:#489248;font-family:'SF Mono',Consolas,Monaco,Inconsolata,monospace;font-size:17px;font-weight:500;flex-shrink:0;margin-right:10px}
+    .terminal-input{flex:1;min-width:0;height:28px;padding:0;padding-top:3px;font-family:'SF Mono',Consolas,Monaco,Inconsolata,monospace;font-size:16px;line-height:1.25;color:#e0e0e0;background:transparent!important;background-color:transparent!important;border:none;outline:none;box-shadow:none;caret-color:#e0e0e0;-webkit-appearance:none;appearance:none;vertical-align:baseline}
+    .terminal-input::-webkit-search-decoration,.terminal-input::-webkit-search-cancel-button,.terminal-input::-webkit-search-results-button,.terminal-input::-webkit-search-results-decoration{display:none!important}
+    .terminal-input::placeholder{color:#999}
+    .terminal-input:focus{outline:none;border:none;box-shadow:none}
+    @media (max-width:768px){
+      .terminal-drag-wrapper{left:10px;right:10px;top:50%;transform:translateY(-50%);width:auto}
+      .terminal-window{width:100%!important;min-height:320px;max-width:100%}
+      .terminal-titlebar{font-size:12px;padding:8px 12px}
+      .terminal-search{padding:12px 14px 16px 6px}
+      .terminal-prompt{font-size:15px}
+      .terminal-input{font-size:15px;height:26px}
+    }
+  </style>
+  <!-- Relative path inside the extension package (not /assets/css/ from a website root) -->
+  <link rel="stylesheet" href="assets/frontpage.css">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+</head>
+<body class="google-only">
+  <!--
+    BROKEN: google.html started with Jekyll front matter:
+      ---
+      layout: newtab
+      permalink: /google/
+      ---
+    That only works when built by Jekyll into a static site. Here the markup is the page.
+  -->
+  <div class="initial-content" style="padding:0;margin:0;max-width:none">
+    <div class="google-page-full">
+      <canvas id="google-particle-canvas" class="google-particle-canvas"></canvas>
+    </div>
+
+    <div class="terminal-drag-wrapper" id="terminal-drag-wrapper">
+      <div class="terminal-window" id="terminal-window">
+        <div class="terminal-titlebar" id="terminal-titlebar">yashjain - -ysh</div>
+        <div class="terminal-search">
+          <div class="terminal-output" id="terminal-output"></div>
+          <div class="terminal-form-row">
+            <form class="terminal-form" id="terminal-form" action="https://www.google.com/search" method="get" target="_top">
+              <span class="terminal-prompt">yashjain@google $</span>
+              <input type="search" class="terminal-input" name="q" id="terminal-input" placeholder="Search or type a command..." autocomplete="off" autofocus>
+            </form>
+            <div class="terminal-tab-options" id="terminal-tab-options"></div>
+          </div>
+        </div>
+        <div class="terminal-resize-handle" id="terminal-resize-handle"></div>
+      </div>
+    </div>
+  </div>
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="js/particles.js"></script>
+  <script src="js/terminal.js"></script>
+</body>
+</html>

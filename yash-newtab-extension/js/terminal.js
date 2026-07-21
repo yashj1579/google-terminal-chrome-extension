@@ -1,0 +1,2790 @@
+(function() {
+  var form = document.getElementById('terminal-form');
+  var input = document.getElementById('terminal-input');
+  var outputEl = document.getElementById('terminal-output');
+  var tabOptions = document.getElementById('terminal-tab-options');
+  var win = document.getElementById('terminal-window');
+  var wrapper = document.getElementById('terminal-drag-wrapper');
+  var titlebar = document.getElementById('terminal-titlebar');
+  var resizeHandle = document.getElementById('terminal-resize-handle');
+
+  function appendOutput(cmdLine, outputLines) {
+    if (!outputEl) return;
+    var cmdDiv = document.createElement('div');
+    cmdDiv.className = 'terminal-output-line';
+    cmdDiv.textContent = 'yashjain@google $ ' + cmdLine;
+    outputEl.appendChild(cmdDiv);
+    (outputLines || []).forEach(function(line) {
+      var out = document.createElement('div');
+      out.className = 'terminal-output-line terminal-output-result';
+      out.textContent = line;
+      outputEl.appendChild(out);
+    });
+    outputEl.scrollTop = outputEl.scrollHeight;
+  }
+
+  // WAS: postMessage to parent extension shell that redirected to GitHub Pages.
+  // NOW: this page is the extension newtab — navigate the tab directly.
+  function navigateTo(url) {
+    try {
+      window.location.assign(url);
+    } catch (e) {
+      window.location.href = url;
+    }
+  }
+
+  function submitSearchForm() {
+    var q = (form.querySelector('input[name=q]') || input).value;
+    if (q == null) q = input.value;
+    var url = 'https://www.google.com/search?q=' + encodeURIComponent((q || '').toString());
+    navigateTo(url);
+  }
+
+  function appendResultLine(text) {
+    if (!outputEl) return;
+    var out = document.createElement('div');
+    out.className = 'terminal-output-line terminal-output-result';
+    out.textContent = text;
+    outputEl.appendChild(out);
+    outputEl.scrollTop = outputEl.scrollHeight;
+  }
+
+  var FS_KEY = 'yash_terminal_fs';
+  var CWD_KEY = 'yash_terminal_cwd';
+  var TASKS_KEY = 'yash_terminal_tasks';
+  function getCwd() {
+    try { return sessionStorage.getItem(CWD_KEY) || '/home'; } catch (e) { return '/home'; }
+  }
+  function setCwd(path) {
+    try { sessionStorage.setItem(CWD_KEY, path); } catch (e) {}
+  }
+  function getFs() {
+    try {
+      var s = localStorage.getItem(FS_KEY);
+      if (s) return JSON.parse(s);
+    } catch (e) {}
+    var defaultFs = { '/': { type: 'dir' }, '/home': { type: 'dir' } };
+    try { localStorage.setItem(FS_KEY, JSON.stringify(defaultFs)); } catch (e) {}
+    return defaultFs;
+  }
+  function saveFs(fs) {
+    try { localStorage.setItem(FS_KEY, JSON.stringify(fs)); } catch (e) {}
+  }
+  function resolvePath(cwd, name) {
+    if (!name || name === '.') return cwd;
+    if (name === '..') {
+      var i = cwd.lastIndexOf('/', cwd.length - 2);
+      return i <= 0 ? '/' : cwd.slice(0, i || 1);
+    }
+    if (name === '~' || name === '~/' || name === '~\\') return '/home';
+    if (name.charAt(0) === '/') return name.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+    var base = cwd === '/' ? '' : cwd;
+    var joined = (base + '/' + name).replace(/\/+/g, '/');
+    return joined.slice(0, 2) === '//' ? joined.slice(1) : joined || '/';
+  }
+  function listDir(fs, path) {
+    path = (path || '/').replace(/\/$/, '') || '/';
+    var prefix = path === '/' ? '/' : path + '/';
+    var seen = {};
+    for (var key in fs) {
+      if (key === path || (key.indexOf(prefix) === 0 && key.length > prefix.length)) {
+        var rest = key.slice(prefix.length);
+        var name = rest.indexOf('/') >= 0 ? rest.slice(0, rest.indexOf('/')) : rest;
+        if (name && !seen[name]) { seen[name] = true; }
+      }
+    }
+    return Object.keys(seen).sort();
+  }
+  function getEntry(fs, path) {
+    path = (path || '/').replace(/\/+$/, '') || '/';
+    return fs[path];
+  }
+  function getFileContent(fs, path) {
+    var e = getEntry(fs, path);
+    return e && e.type === 'file' ? e.content : undefined;
+  }
+  function setFileContent(fs, path, content) {
+    path = (path || '').replace(/\/+$/, '');
+    if (!path) return false;
+    fs[path] = { type: 'file', content: content == null ? '' : String(content) };
+    var i = path.lastIndexOf('/');
+    while (i > 0) {
+      var parent = path.slice(0, i);
+      if (!fs[parent]) fs[parent] = { type: 'dir' };
+      i = path.lastIndexOf('/', i - 1);
+    }
+    if (!fs['/']) fs['/'] = { type: 'dir' };
+    saveFs(fs);
+    return true;
+  }
+  function mkdirFs(fs, path) {
+    path = (path || '').replace(/\/+$/, '');
+    if (!path || path === '/') return false;
+    if (fs[path]) return fs[path].type === 'dir';
+    fs[path] = { type: 'dir' };
+    var i = path.lastIndexOf('/');
+    while (i > 0) {
+      var parent = path.slice(0, i);
+      if (!fs[parent]) fs[parent] = { type: 'dir' };
+      i = path.lastIndexOf('/', i - 1);
+    }
+    if (!fs['/']) fs['/'] = { type: 'dir' };
+    saveFs(fs);
+    return true;
+  }
+  function rmFs(fs, path, recursive) {
+    path = (path || '').replace(/\/+$/, '');
+    if (!path || path === '/') return false;
+    var e = fs[path];
+    if (!e) return false;
+    if (e.type === 'dir' && !recursive) {
+      var children = listDir(fs, path);
+      if (children.length > 0) return false;
+    }
+    if (e.type === 'dir' && recursive) {
+      var prefix = path + '/';
+      var toDel = [path];
+      for (var k in fs) { if (k.indexOf(prefix) === 0) toDel.push(k); }
+      toDel.sort(function(a, b) { return b.length - a.length; });
+      toDel.forEach(function(k) { delete fs[k]; });
+    } else {
+      delete fs[path];
+    }
+    saveFs(fs);
+    return true;
+  }
+
+  function collectFilesInDir(fs, dirPath, recursive) {
+    var result = [];
+    var names = listDir(fs, dirPath);
+    names.forEach(function(name) {
+      var fullPath = dirPath === '/' ? '/' + name : dirPath + '/' + name;
+      var e = getEntry(fs, fullPath);
+      if (e && e.type === 'file') {
+        result.push(fullPath);
+      } else if (recursive && e && e.type === 'dir') {
+        result = result.concat(collectFilesInDir(fs, fullPath, true));
+      }
+    });
+    return result.sort();
+  }
+
+  function openVimFileEditor(fullPath, title) {
+    var fs = getFs();
+    var e = getEntry(fs, fullPath);
+    if (!e) setFileContent(fs, fullPath, '');
+    var content = (e && e.type === 'file' ? e.content : '') || '';
+    var displayTitle = title || fullPath.split('/').pop() || fullPath;
+    var contentBox = document.createElement('div');
+    contentBox.className = 'popup-date';
+    contentBox.style.minHeight = '200px';
+    var textarea = document.createElement('textarea');
+    textarea.placeholder = 'Edit content...';
+    textarea.style.cssText = 'width:100%;height:180px;resize:vertical;font-family:inherit;font-size:14px;padding:8px;border:1px solid #444;background:#2a2a2a;color:#e0e0e0;border-radius:4px;';
+    textarea.value = content;
+    var saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.textContent = 'Save';
+    saveBtn.style.cssText = 'margin-top:8px;padding:6px 14px;cursor:pointer;background:#0a7;color:#fff;border:none;border-radius:4px;';
+    saveBtn.addEventListener('click', function() {
+      setFileContent(getFs(), fullPath, textarea.value);
+    });
+    contentBox.appendChild(textarea);
+    contentBox.appendChild(saveBtn);
+    createPopupWindow(displayTitle, contentBox, null, { width: 400, height: 280 });
+  }
+
+  var commandHistory = [];
+  var historyIndex = -1;
+  var dragStartX, dragStartY, dragStartLeft, dragStartTop;
+  var resizeStartX, resizeStartY, resizeStartW, resizeStartH;
+  var minW = 400, minH = 280;
+
+  var COMMANDS = [
+    'color',
+    'color -ls',
+    'color reset',
+    'color default',
+    'color cyber',
+    'color red',
+    'color blue',
+    'color fire',
+    'color rainbow',
+    'color cool',
+    'color forest',
+    'color chocolate',
+    'color ocean',
+    'color mist',
+    'color lavender',
+    'color aussie',
+    'color desert',
+    'color dessert',
+    'color confetti',
+    'color royal',
+    'color street',
+    'color dark',
+    'color light',
+    'color chaos',
+    'color code',
+    'color candy',
+    'color panda',
+    'color green',
+    'color burntorange',
+    'color gray',
+    'color grey',
+    'color cyber2',
+    'color gradient',
+    'color #rrggbb',
+
+    'whoami',
+    'radius',
+    'distort',
+    'force',
+
+    'mail',
+    'outlook',
+    'github',
+    'linkedin',
+    'drive',
+    'docs',
+    'slides',
+    'sheets',
+    'website',
+    'utexas',
+    'canvas',
+    'd',
+    'u',
+    'm',
+    's',
+    'g',
+    'chat',
+    'o',
+
+    'pwd',
+    'ls -com',
+    'cd',
+    'mkdir',
+    'touch',
+    'rm',
+    'rm -r',
+    'cat',
+    'type',
+    'vim',
+    'def',
+    'vim list',
+    'vim todo',
+    'vim tido',
+    'vim planner',
+    'vim -a',
+    'vim -d',
+
+    'echo',
+    'big',
+    'history',
+    'ip',
+    'clear',
+    'close',
+    'popup',
+    'help',
+    'ls',
+    'calc',
+    'convert',
+    'solve',
+    'prime',
+    'divisor',
+    'div',
+    'gcd',
+    'lcm',
+    'timer',
+    'timer -s',
+    'clock',
+    'time',
+    'date',
+    'calculator',
+    'calendar',
+    'calender',
+    'cal',
+    'battery',
+    'charge',
+    'temperature',
+    'temp',
+    'hot',
+    'cold',
+    'weather',
+    'location',
+    'scratch',
+    'scratchpad',
+    'notes',
+    'board',
+    'write',
+    'whiteboard',
+    'blackboard',
+    'random',
+    'random -d',
+    'random -pick',
+  ];
+
+  function getCompletions(prefix) {
+    prefix = (prefix || '').trim();
+    var cdMatch = /^cd\s+(.*)$/.exec(prefix);
+    if (cdMatch) {
+      var pathPart = cdMatch[1];
+      var cwd = getCwd();
+      var fs = getFs();
+      var basePath = cwd;
+      var prefixName = '';
+      if (pathPart.indexOf('/') >= 0) {
+        var lastSlash = pathPart.lastIndexOf('/');
+        basePath = resolvePath(cwd, pathPart.slice(0, lastSlash) || '/');
+        prefixName = pathPart.slice(lastSlash + 1);
+      } else {
+        prefixName = pathPart;
+      }
+      var names = listDir(fs, basePath);
+      if (prefixName === '' || prefixName === '.' || prefixName === '..') {
+        names.push('..', '.', '~', '/');
+      } else {
+        if ('..'.indexOf(prefixName) === 0) names.push('..');
+        if ('.'.indexOf(prefixName) === 0) names.push('.');
+        if ('~'.indexOf(prefixName) === 0) names.push('~');
+        if ('/'.indexOf(prefixName) === 0) names.push('/');
+      }
+      var lower = prefixName.toLowerCase();
+      var matches = names.filter(function(n) { return n.toLowerCase().indexOf(lower) === 0; });
+      matches.sort();
+      var out = [];
+      for (var i = 0; i < matches.length && out.length < 10; i++) {
+        var name = matches[i];
+        if (name === '..' || name === '.' || name === '~' || name === '/') {
+          out.push('cd ' + name);
+        } else {
+          var fullPath = basePath === '/' ? '/' + name : basePath + '/' + name;
+          var e = getEntry(fs, fullPath);
+          var isDir = e && e.type === 'dir';
+          var comp = 'cd ' + (basePath === '/' ? '/' : basePath + '/') + name + (isDir ? '/' : '');
+          out.push(comp);
+        }
+      }
+      return out;
+    }
+    var vimTabMatch = /^vim\s+(.*)$/.exec(prefix);
+    if (vimTabMatch) {
+      var vimPart = vimTabMatch[1];
+      var cwd = getCwd();
+      var fs = getFs();
+      var basePath = cwd;
+      var prefixName = vimPart;
+      if (vimPart.indexOf('/') >= 0) {
+        var vimSlash = vimPart.lastIndexOf('/');
+        basePath = resolvePath(cwd, vimPart.slice(0, vimSlash) || '/');
+        prefixName = vimPart.slice(vimSlash + 1);
+      }
+      var staticVim = ['list', 'todo', 'tido', 'planner', '-a', '-d'];
+      var lowerVim = prefixName.toLowerCase();
+      var vimMatches = staticVim.filter(function(n) { return !prefixName || n.toLowerCase().indexOf(lowerVim) === 0; });
+      var dirNames = listDir(fs, basePath);
+      dirNames.forEach(function(name) {
+        if (!prefixName || name.toLowerCase().indexOf(lowerVim) === 0) {
+          var fullPath = basePath === '/' ? '/' + name : basePath + '/' + name;
+          var ent = getEntry(fs, fullPath);
+          if (ent && ent.type === 'dir') vimMatches.push(name + '/');
+          else if (ent && ent.type === 'file') vimMatches.push(name);
+          else if (!ent && name.toLowerCase().indexOf(lowerVim) === 0) vimMatches.push(name);
+        }
+      });
+      vimMatches.sort();
+      var vimOut = [];
+      var vimPrefix = 'vim ' + (vimPart.indexOf('/') >= 0 ? vimPart.slice(0, vimPart.lastIndexOf('/') + 1) : '');
+      for (var vi = 0; vi < vimMatches.length && vimOut.length < 10; vi++) {
+        vimOut.push(vimPrefix + vimMatches[vi]);
+      }
+      return vimOut;
+    }
+    prefix = (prefix || '').toLowerCase();
+    var out = [];
+    for (var i = 0; i < COMMANDS.length && out.length < 5; i++) {
+      if (COMMANDS[i].toLowerCase().indexOf(prefix) === 0) out.push(COMMANDS[i]);
+    }
+    return out;
+  }
+
+  function showTabOptions(completions) {
+    tabOptions.innerHTML = '';
+    if (!tabOptions) return;
+    if (completions.length === 0) return;
+    completions.forEach(function(c) {
+      var line = document.createElement('div');
+      line.className = 'terminal-tab-option';
+      line.textContent = c;
+      tabOptions.appendChild(line);
+    });
+    tabOptions.classList.add('terminal-tab-options-visible');
+  }
+
+  function hideTabOptions() {
+    if (tabOptions) tabOptions.classList.remove('terminal-tab-options-visible');
+    if (tabOptions) tabOptions.innerHTML = '';
+  }
+
+  function safeEvalExpr(expr) {
+    expr = expr.replace(/\s+/g, ' ').trim();
+    var s = expr.replace(/\b(sqrt|sin|cos|tan|log|exp|pow|abs|round|floor|ceil)\s*\(/gi, 'Math.$1(');
+    s = s.replace(/\bPI\b/g, 'Math.PI').replace(/\bE\b/g, 'Math.E');
+    var safe = s.replace(/Math\.[a-zA-Z]+/g, '');
+    if (!/^[\d+\-*/().\s%]*$/.test(safe)) return null;
+    try {
+      return new Function('return (' + s + ')')();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  var LENGTH_TO_M = { m: 1, meter: 1, km: 1000, cm: 0.01, mm: 0.001, mi: 1609.344, mile: 1609.344, miles: 1609.344, ft: 0.3048, foot: 0.3048, feet: 0.3048, in: 0.0254, inch: 0.0254, inches: 0.0254, yd: 0.9144, yard: 0.9144 };
+  var MASS_TO_KG = { kg: 1, g: 0.001, gram: 0.001, lb: 0.453592, lbs: 0.453592, pound: 0.453592, pounds: 0.453592, oz: 0.0283495 };
+  var TIME_TO_S = { s: 1, sec: 1, second: 1, seconds: 1, min: 60, minute: 60, minutes: 60, h: 3600, hr: 3600, hour: 3600, hours: 3600, d: 86400, day: 86400, days: 86400, week: 604800, weeks: 604800, year: 31557600, years: 31557600 };
+  function convertUnits(num, unit1, unit2) {
+    var n = parseFloat(num);
+    if (isNaN(n)) return null;
+    unit1 = (unit1 || '').toLowerCase().replace(/celcius/, 'celsius');
+    unit2 = (unit2 || '').toLowerCase().replace(/celcius/, 'celsius');
+    var tempUnits = ['c', 'f', 'k', 'celsius', 'fahrenheit', 'kelvin'];
+    var u1t = tempUnits.indexOf(unit1) >= 0;
+    var u2t = tempUnits.indexOf(unit2) >= 0;
+    if (u1t && u2t) {
+      var toC = function(v, u) {
+        if (u === 'c' || u === 'celsius') return v;
+        if (u === 'f' || u === 'fahrenheit') return (v - 32) * 5 / 9;
+        if (u === 'k' || u === 'kelvin') return v - 273.15;
+        return v;
+      };
+      var fromC = function(v, u) {
+        if (u === 'c' || u === 'celsius') return v;
+        if (u === 'f' || u === 'fahrenheit') return v * 9 / 5 + 32;
+        if (u === 'k' || u === 'kelvin') return v + 273.15;
+        return v;
+      };
+      var c = toC(n, unit1);
+      return fromC(c, unit2);
+    }
+    if (LENGTH_TO_M[unit1] !== undefined && LENGTH_TO_M[unit2] !== undefined) {
+      var meters = n * LENGTH_TO_M[unit1];
+      return meters / LENGTH_TO_M[unit2];
+    }
+    if (MASS_TO_KG[unit1] !== undefined && MASS_TO_KG[unit2] !== undefined) {
+      var kg = n * MASS_TO_KG[unit1];
+      return kg / MASS_TO_KG[unit2];
+    }
+    if (TIME_TO_S[unit1] !== undefined && TIME_TO_S[unit2] !== undefined) {
+      var secs = n * TIME_TO_S[unit1];
+      return secs / TIME_TO_S[unit2];
+    }
+    return null;
+  }
+
+  function solveQuadratic(a, b, c) {
+    a = parseFloat(a); b = parseFloat(b); c = parseFloat(c);
+    if (isNaN(a) || isNaN(b) || isNaN(c)) return null;
+    if (Math.abs(a) < 1e-10) {
+      if (Math.abs(b) < 1e-10) return null;
+      return [-c / b];
+    }
+    var d = b * b - 4 * a * c;
+    if (d < -1e-10) return [];
+    if (d < 1e-10) return [-b / (2 * a)];
+    var s = Math.sqrt(d);
+    return [(-b + s) / (2 * a), (-b - s) / (2 * a)];
+  }
+
+  function isPrime(n) {
+    n = Math.floor(Number(n));
+    if (n < 2 || !isFinite(n)) return false;
+    if (n === 2) return true;
+    if (n % 2 === 0) return false;
+    for (var i = 3; i * i <= n; i += 2) {
+      if (n % i === 0) return false;
+    }
+    return true;
+  }
+
+  function getDivisors(n) {
+    n = Math.floor(Math.abs(Number(n)));
+    if (n === 0) return [];
+    var out = [];
+    for (var i = 1; i * i <= n; i++) {
+      if (n % i === 0) {
+        out.push(i);
+        if (i !== n / i) out.push(n / i);
+      }
+    }
+    out.sort(function(a, b) { return a - b; });
+    return out;
+  }
+
+  function gcd(a, b) {
+    a = Math.floor(Math.abs(Number(a)));
+    b = Math.floor(Math.abs(Number(b)));
+    while (b !== 0) {
+      var t = b;
+      b = a % b;
+      a = t;
+    }
+    return a;
+  }
+
+  function lcm(a, b) {
+    a = Math.floor(Math.abs(Number(a)));
+    b = Math.floor(Math.abs(Number(b)));
+    if (a === 0 && b === 0) return 0;
+    return (a * b) / gcd(a, b);
+  }
+
+  var popupZIndex = 1001;
+  function createPopupWindow(title, contentEl, onClose, options) {
+    var wrapper = document.createElement('div');
+    wrapper.className = 'popup-wrapper';
+    wrapper.style.zIndex = popupZIndex++;
+    wrapper.addEventListener('mousedown', function() {
+      wrapper.style.zIndex = popupZIndex++;
+    });
+    var win = document.createElement('div');
+    win.className = 'popup-window';
+    var titlebar = document.createElement('div');
+    titlebar.className = 'popup-titlebar';
+    var closeBtn = document.createElement('button');
+    closeBtn.className = 'popup-close';
+    closeBtn.textContent = '\u00d7';
+    closeBtn.type = 'button';
+    var titleSpan = document.createElement('span');
+    titleSpan.className = 'popup-title';
+    titleSpan.textContent = title;
+    var content = document.createElement('div');
+    content.className = 'popup-content';
+    if (contentEl) content.appendChild(contentEl);
+    var resizeHandle = document.createElement('div');
+    resizeHandle.className = 'popup-resize-handle';
+    titlebar.appendChild(closeBtn);
+    titlebar.appendChild(titleSpan);
+    win.appendChild(titlebar);
+    win.appendChild(content);
+    win.appendChild(resizeHandle);
+    wrapper.appendChild(win);
+    var opts = options || {};
+    if (opts.darkTheme) wrapper.classList.add('popup-wrapper--dark');
+    var minW = opts.minW != null ? opts.minW : 200;
+    var minH = opts.minH != null ? opts.minH : 120;
+    var w = opts.width != null ? opts.width : 280;
+    var h = opts.height != null ? opts.height : 160;
+    var topOffset = opts.topOffset != null ? opts.topOffset : -40;
+    var leftOffset = opts.leftOffset != null ? opts.leftOffset : 80;
+    var vw = window.innerWidth, vh = window.innerHeight;
+    wrapper.style.left = Math.max(20, (vw - w) / 2 + leftOffset) + 'px';
+    wrapper.style.top = Math.max(20, (vh - h) / 2 + topOffset) + 'px';
+    win.style.width = w + 'px';
+    win.style.height = h + 'px';
+    closeBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      wrapper.classList.add('popup-closing');
+      win.addEventListener('animationend', function closeAnimEnd(ev) {
+        if (ev.target !== win) return;
+        win.removeEventListener('animationend', closeAnimEnd);
+        if (typeof onClose === 'function') onClose();
+        wrapper.remove();
+      });
+    });
+    var dragStartX, dragStartY, dragStartLeft, dragStartTop;
+    titlebar.addEventListener('mousedown', function(e) {
+      if (e.target === closeBtn) return;
+      e.preventDefault();
+      var r = wrapper.getBoundingClientRect();
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      dragStartLeft = r.left;
+      dragStartTop = r.top;
+      function move(ev) {
+        var dx = ev.clientX - dragStartX;
+        var dy = ev.clientY - dragStartY;
+        wrapper.style.left = Math.max(0, dragStartLeft + dx) + 'px';
+        wrapper.style.top = Math.max(0, dragStartTop + dy) + 'px';
+      }
+      function stop() {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', stop);
+      }
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', stop);
+    });
+    var resizeStartX, resizeStartY, resizeStartW, resizeStartH;
+    resizeHandle.addEventListener('mousedown', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var r = win.getBoundingClientRect();
+      resizeStartX = e.clientX;
+      resizeStartY = e.clientY;
+      resizeStartW = r.width;
+      resizeStartH = r.height;
+      function move(ev) {
+        var dw = ev.clientX - resizeStartX;
+        var dh = ev.clientY - resizeStartY;
+        win.style.width = Math.max(minW, resizeStartW + dw) + 'px';
+        win.style.height = Math.max(minH, resizeStartH + dh) + 'px';
+      }
+      function stop() {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', stop);
+      }
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', stop);
+    });
+    document.body.appendChild(wrapper);
+    requestAnimationFrame(function() {
+      wrapper.classList.add('popup-enter');
+    });
+    return { wrapper: wrapper, win: win, content: content };
+  }
+
+  wrapper.addEventListener('mousedown', function() {
+    wrapper.style.zIndex = popupZIndex++;
+  });
+
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      var val = input.value.trim();
+      var completions = getCompletions(val);
+      if (completions.length === 1) {
+        var c = completions[0];
+        input.value = c + (c === 'color' ? ' ' : '');
+        hideTabOptions();
+      } else if (completions.length > 1) {
+        showTabOptions(completions.slice(0, 5));
+      } else {
+        hideTabOptions();
+      }
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (commandHistory.length === 0) return;
+      if (historyIndex === -1) {
+        historyIndex = commandHistory.length - 1;
+      } else if (historyIndex > 0) {
+        historyIndex--;
+      }
+      input.value = commandHistory[historyIndex];
+      hideTabOptions();
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (historyIndex === -1) return;
+      if (historyIndex < commandHistory.length - 1) {
+        historyIndex++;
+        input.value = commandHistory[historyIndex];
+      } else {
+        historyIndex = -1;
+        input.value = '';
+      }
+      hideTabOptions();
+    } else {
+      historyIndex = -1;
+      hideTabOptions();
+    }
+  });
+
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    historyIndex = -1;
+    var raw = input.value.trim();
+    var displayLine = raw;
+    var forceSearch = false;
+    if (raw.indexOf('/') === 0) {
+      forceSearch = true;
+      raw = raw.slice(1).trim();
+    }
+    if (forceSearch) {
+      appendOutput(displayLine, []);
+      input.value = raw;
+      submitSearchForm();
+      return;
+    }
+    commandHistory.push(raw);
+    var execFileMatch = /^\.\/(.+)$/.exec(raw);
+    if (execFileMatch) {
+      var execName = execFileMatch[1].trim();
+      var execCwd = getCwd();
+      var execFs = getFs();
+      var execPath = resolvePath(execCwd, execName);
+      var execEntry = getEntry(execFs, execPath);
+      if (execEntry && execEntry.type === 'file') {
+        var execContent = (execEntry.content || '').trim();
+        appendOutput(raw, execContent ? ['Searching: ' + execContent] : ['(empty file)']);
+        if (execContent) {
+          input.value = execContent;
+          submitSearchForm();
+        } else {
+          input.value = '';
+        }
+      } else {
+        appendOutput(raw, ['./' + execName + ': no such file']);
+        input.value = '';
+      }
+      hideTabOptions();
+      return;
+    }
+    var historyMatch = /^history\s*$/.exec(raw);
+    var historyLMatch = /^history\s+-l\s+(\d+)\s*$/.exec(raw);
+    if (/^clear\s*$/.test(raw)) {
+      if (outputEl) outputEl.innerHTML = '';
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^close\s*$/.test(raw)) {
+      var wrappers = document.querySelectorAll('.popup-wrapper');
+      wrappers.forEach(function(wrapper) {
+        var closeBtn = wrapper.querySelector('.popup-close');
+        if (closeBtn) closeBtn.click();
+        else wrapper.remove();
+      });
+      appendOutput(raw, wrappers.length ? ['Closed ' + wrappers.length + ' popup(s).'] : ['No popups open.']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^popup\s+.+/.test(raw)) {
+      var popupUrlMatch = /^popup\s+(.+)$/.exec(raw);
+      if (popupUrlMatch) {
+        var arg = popupUrlMatch[1].trim();
+        var url = null;
+        var title = 'Website';
+
+        if (arg === 'ls') {
+          appendOutput(raw, [
+            'popup desmos     - Desmos graphing calculator',
+            'popup advcalc    - Desmos scientific calculator',
+            'popup graph      - Desmos graphing (same as desmos)',
+            'popup wordle     - NYT Wordle',
+            'popup wiki <topic> - Wikipedia article',
+            'popup <url>      - Open URL in popup',
+            'popup <query>    - Google search (new window)'
+          ]);
+          input.value = '';
+          hideTabOptions();
+          return;
+        }
+
+        var wikiMatch = /^wiki\s+(.+)$/.exec(arg);
+        if (wikiMatch) {
+          var topic = wikiMatch[1].trim();
+          var slug = encodeURIComponent(topic).replace(/%20/g, '_');
+          url = 'https://en.wikipedia.org/wiki/' + slug;
+          title = 'Wikipedia';
+        } else if (arg === 'desmos' || arg === 'graph') {
+          url = 'https://www.desmos.com/';
+          title = 'Desmos';
+        } else if (arg === 'advcalc') {
+          url = 'https://www.desmos.com/scientific';
+          title = 'Desmos Scientific';
+        } else if (arg === 'wordle') {
+          url = 'https://www.nytimes.com/games/wordle/index.html';
+          title = 'Wordle';
+        }
+
+        if (!url) {
+          if (/^https?:\/\//i.test(arg)) {
+            url = arg;
+          } else if (/^[a-z0-9][-a-z0-9.]*\.[a-z0-9].*$/i.test(arg) && !/\s/.test(arg)) {
+            url = 'https://' + arg;
+          } else {
+            url = 'https://www.google.com/search?q=' + encodeURIComponent(arg);
+          }
+        }
+
+        var isGoogle = false;
+        var isNyt = false;
+        var hostname = '';
+        try {
+          var a = document.createElement('a');
+          a.href = url;
+          hostname = a.hostname || '';
+          isGoogle = hostname.indexOf('google') !== -1;
+          isNyt = hostname.indexOf('nytimes') !== -1;
+          if (!title || title === 'Website') title = hostname || 'Website';
+        } catch (err) {}
+        if (isGoogle) {
+          window.open(url, '_blank', 'noopener,noreferrer,width=900,height=700');
+          appendOutput(raw, ['Opened in new window (Google cannot be embedded).']);
+        } else if (isNyt) {
+          window.open(url, '_blank', 'noopener,noreferrer,width=900,height=700');
+          appendOutput(raw, ['Opened in new window.']);
+        } else {
+          var box = document.createElement('div');
+          box.style.cssText = 'flex:1;min-height:0;margin:-16px;padding:0;overflow:hidden;display:flex;flex-direction:column;';
+          var iframe = document.createElement('iframe');
+          iframe.src = url;
+          iframe.style.cssText = 'flex:1;width:100%;border:none;min-height:0;display:block;';
+          box.appendChild(iframe);
+          createPopupWindow(title, box, null, { width: 900, height: 700, minW: 400, minH: 300 });
+          appendOutput(raw, ['Opened in popup.']);
+        }
+        input.value = '';
+        hideTabOptions();
+        return;
+      }
+    }
+    if (/^popup\s*$/.test(raw)) {
+      appendOutput(raw, []);
+      var popupCommands = ['calculator', 'calendar', 'clock', 'date', 'battery', 'temperature', 'weather', 'location', 'scratch', 'random', 'big'];
+      popupCommands.forEach(function(cmd, i) {
+        setTimeout(function() {
+          input.value = cmd;
+          form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+        }, i * 120);
+      });
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var helpMatch = /^help\s+(.+)$/.test(raw);
+    var helpTopic = helpMatch ? /^help\s+(.+)$/.exec(raw)[1].trim().toLowerCase() : null;
+    if (/^help\s*$/.test(raw) || helpMatch) {
+      var HELP = {
+        calc: 'calc [expr] - Evaluate a math expression (e.g. calc 2+3*4). Type calc or calculator to open the calculator popup.',
+        calculator: 'calculator / calc - Open the calculator popup.',
+        calendar: 'calendar / cal / calender - Open the calendar popup.',
+        clock: 'clock / time - Open the clock popup (analog/digital).',
+        date: 'date - Open the date popup with format options.',
+        timer: 'timer [mins] / timer -s [secs] - Start a countdown timer (default 5 min).',
+        battery: 'battery / charge - Open the battery status popup.',
+        temperature: 'temperature / temp / hot / cold - Open the temperature popup (outside temp + thermometer).',
+        weather: 'weather - Open the weather conditions popup (no temperature).',
+        location: 'location - Open a map popup; enter coordinates or use My location.',
+        scratch: 'scratch / scratchpad / notes / board / write - Open a scratch pad to draw.',
+        whiteboard: 'whiteboard - Open a whiteboard (white background, black ink).',
+        blackboard: 'blackboard - Open a blackboard (black background, white ink).',
+        random: 'random - Open random number popup. random -d (double 0-1), random 1 20 (range), random -pick a b c (pick one).',
+        popup: 'popup - Open all popup windows at once (except timer). popup ls - List popup shortcuts. popup desmos / graph - Desmos. popup advcalc - Desmos scientific. popup wiki <topic> - Wikipedia. popup <url> / <query> - Open in popup or new window.',
+        help: 'help [command] - Show this help. Use "help" for overview or "help <cmd>" for a command.',
+        close: 'close - Close all open popup windows.',
+        ls: 'ls - List directory. ls -com - List all terminal commands.',
+        clear: 'clear - Clear the terminal output.',
+        history: 'history / history -l N - Show command history (last N with -l).',
+        echo: 'echo <text> - Print text.',
+        def: 'def <word> - Open Merriam-Webster definition in a popup.',
+        color: 'color [name] / color -ls / color reset - Change particle colors. Use color -ls to list palettes.',
+        whoami: 'whoami - Show username.',
+        ip: 'ip - Show IP info.',
+        convert: 'convert <num> <unit> to <unit> - Convert units (length, mass, temp, time).',
+        solve: 'solve a b c - Solve ax² + bx + c = 0.',
+        prime: 'prime <n> - Check if n is prime.',
+        divisor: 'divisor <n> - List divisors.',
+        gcd: 'gcd a b - Greatest common divisor.',
+        lcm: 'lcm a b - Least common multiple.',
+        mail: 'mail - Open Gmail.',
+        outlook: 'outlook - Open Outlook mail.',
+        github: 'github - Open GitHub.',
+        linkedin: 'linkedin - Open LinkedIn.',
+        drive: 'drive - Open Google Drive.',
+        docs: 'docs - Open Google Docs.',
+        website: 'website - Open website.',
+        utexas: 'utexas / canvas - Open UT Canvas (utexas.instructure.com).',
+        canvas: 'canvas / utexas - Open UT Canvas (utexas.instructure.com).',
+        d: 'd - Open Google Drive.',
+        u: 'u - Open Canvas (utexas.instructure.com).',
+        m: 'm - Open Gmail.',
+        s: 's - Open Google Sheets.',
+        g: 'g - Open GitHub.',
+        chat: 'chat - Open ChatGPT.',
+        o: 'o - Open Outlook mail.',
+        big: 'big - Open big letter typer (scales text to fit one line).',
+        pwd: 'pwd - Print working directory.',
+        cd: 'cd [path] - Change directory. cd .., cd ~, cd /',
+        mkdir: 'mkdir <name> - Create directory.',
+        touch: 'touch <name> - Create or update file.',
+        rm: 'rm <name> - Remove file. rm -r <name> - Remove directory recursively.',
+        cat: 'cat <name> - Show file content.',
+        type: 'type <name> - Show if path is a text file, folder, or link.',
+        vim: 'vim list / todo / tido / planner - Open tasks. vim -a - All text files (recursive). vim -d - Text files in current dir. vim <url> - Open website. vim <file> - Open file in popup (saved in browser).',
+      };
+      if (/^help\s*$/.test(raw)) {
+        var lines = ['Type help <command> for details. Commands:', '  Popups: calculator, calc, calendar, cal, clock, time, date, timer, battery, charge, temperature, temp, weather, location, scratch, whiteboard, blackboard, random, popup, big', '  Shell: pwd, ls, ls -com, cd, mkdir, touch, rm, rm -r, cat, type, vim, ./<file>', '  Shortcuts: d (drive), u (canvas), m (mail), o (outlook), s (sheets), g (github), chat (ChatGPT)', '  Terminal: clear, close, history, echo, def, help', '  Colors: color, color -ls', '  Math: calc <expr>, convert, solve, prime, divisor, gcd, lcm', '  Links: whoami, ip, mail, outlook, github, linkedin, drive, docs, website, utexas, canvas'];
+        appendOutput(raw, lines);
+      } else if (helpTopic && HELP[helpTopic]) {
+        appendOutput(raw, [HELP[helpTopic]]);
+      } else if (helpTopic) {
+        var similar = Object.keys(HELP).filter(function(k) { return k.indexOf(helpTopic) >= 0 || helpTopic.indexOf(k) >= 0; });
+        appendOutput(raw, similar.length ? ['Unknown command "' + helpTopic + '". Did you mean: ' + similar.join(', ')] : ['Unknown command "' + helpTopic + '". Type help for a list.']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^pwd\s*$/.test(raw)) {
+      appendOutput(raw, [getCwd()]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^ls\s+-com\s*$/.test(raw)) {
+      var seen = {};
+      var list = [];
+      COMMANDS.forEach(function(c) {
+        var base = (c.split(/\s+/)[0] || '').toLowerCase();
+        if (base && !seen[base]) { seen[base] = true; list.push(base); }
+      });
+      list.sort();
+      appendOutput(raw, ['Commands: ' + list.join(', ')]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^ls\s*$/.test(raw)) {
+      var cwd = getCwd();
+      var fs = getFs();
+      var names = listDir(fs, cwd);
+      appendOutput(raw, [names.length ? names.join('  ') : '']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var cdMatch = /^cd\s+(.*)$/.exec(raw);
+    if (cdMatch) {
+      var cwd = getCwd();
+      var target = cdMatch[1].trim() || '~';
+      var resolved = resolvePath(cwd, target);
+      var fs = getFs();
+      var e = getEntry(fs, resolved);
+      if (!e) {
+        appendOutput(raw, ['cd: no such file or directory: ' + target]);
+      } else if (e.type !== 'dir') {
+        appendOutput(raw, ['cd: not a directory: ' + target]);
+      } else {
+        setCwd(resolved);
+        appendOutput(raw, []);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var mkdirMatch = /^mkdir\s+(.+)$/.exec(raw);
+    if (mkdirMatch) {
+      var cwd = getCwd();
+      var name = mkdirMatch[1].trim();
+      var fullPath = resolvePath(cwd, name);
+      var fs = getFs();
+      if (getEntry(fs, fullPath)) {
+        appendOutput(raw, ['mkdir: cannot create directory \'' + name + '\': File exists']);
+      } else if (mkdirFs(fs, fullPath)) {
+        appendOutput(raw, []);
+      } else {
+        appendOutput(raw, ['mkdir: failed to create \'' + name + '\'']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var touchMatch = /^touch\s+(.+)$/.exec(raw);
+    if (touchMatch) {
+      var cwd = getCwd();
+      var name = touchMatch[1].trim();
+      var fullPath = resolvePath(cwd, name);
+      var fs = getFs();
+      var existing = getFileContent(fs, fullPath);
+      setFileContent(fs, fullPath, existing !== undefined ? existing : '');
+      appendOutput(raw, []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var rmRecursiveMatch = /^rm\s+-r\s+(.+)$/.exec(raw);
+    if (rmRecursiveMatch) {
+      var cwd = getCwd();
+      var name = rmRecursiveMatch[1].trim();
+      var fullPath = resolvePath(cwd, name);
+      var fs = getFs();
+      var e = getEntry(fs, fullPath);
+      if (!e) {
+        appendOutput(raw, ['rm: cannot remove \'' + name + '\': No such file or directory']);
+      } else if (rmFs(fs, fullPath, true)) {
+        appendOutput(raw, []);
+      } else {
+        appendOutput(raw, ['rm: failed to remove \'' + name + '\'']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var rmMatch = /^rm\s+(.+)$/.exec(raw);
+    if (rmMatch) {
+      var cwd = getCwd();
+      var name = rmMatch[1].trim();
+      var fullPath = resolvePath(cwd, name);
+      var fs = getFs();
+      var e = getEntry(fs, fullPath);
+      if (!e) {
+        appendOutput(raw, ['rm: cannot remove \'' + name + '\': No such file or directory']);
+      } else if (e.type === 'dir') {
+        appendOutput(raw, ['rm: cannot remove \'' + name + '\': Is a directory (use rm -r)']);
+      } else if (rmFs(fs, fullPath, false)) {
+        appendOutput(raw, []);
+      } else {
+        appendOutput(raw, ['rm: failed to remove \'' + name + '\'']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var catMatch = /^cat\s+(.+)$/.exec(raw);
+    var typeMatch = /^type\s+(.+)$/.exec(raw);
+    if (typeMatch) {
+      var typeName = typeMatch[1].trim();
+      var cwd = getCwd();
+      var fullPath = resolvePath(cwd, typeName);
+      var fs = getFs();
+      var e = getEntry(fs, fullPath);
+      if (e) {
+        if (e.type === 'dir') {
+          appendOutput(raw, ['folder']);
+        } else {
+          appendOutput(raw, ['text file']);
+        }
+      } else if (/^https?:\/\//i.test(typeName) || (/^[a-z0-9][-a-z0-9.]*\.[a-z0-9].*$/i.test(typeName) && !/\s/.test(typeName))) {
+        appendOutput(raw, ['link']);
+      } else {
+        appendOutput(raw, ['type: ' + typeName + ': No such file or directory']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (catMatch) {
+      var cwd = getCwd();
+      var name = catMatch[1].trim();
+      var fullPath = resolvePath(cwd, name);
+      var fs = getFs();
+      var e = getEntry(fs, fullPath);
+      if (!e) {
+        appendOutput(raw, ['cat: ' + name + ': No such file or directory']);
+      } else if (e.type === 'dir') {
+        appendOutput(raw, ['cat: ' + name + ': Is a directory']);
+      } else {
+        var content = e.content || '';
+        appendOutput(raw, content ? content.split(/\n/) : ['']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^vim\s+-a\s*$/.test(raw)) {
+      var fsAll = getFs();
+      var cwdAll = getCwd();
+      var allFiles = collectFilesInDir(fsAll, cwdAll, true);
+      if (allFiles.length === 0) {
+        appendOutput(raw, ['No text files found.']);
+      } else {
+        allFiles.forEach(function(fp) { openVimFileEditor(fp); });
+        appendOutput(raw, ['Opened ' + allFiles.length + ' file(s).']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^vim\s+-d\s*$/.test(raw)) {
+      var fsDir = getFs();
+      var cwdDir = getCwd();
+      var dirFiles = collectFilesInDir(fsDir, cwdDir, false);
+      if (dirFiles.length === 0) {
+        appendOutput(raw, ['No text files in current directory.']);
+      } else {
+        dirFiles.forEach(function(fp) { openVimFileEditor(fp); });
+        appendOutput(raw, ['Opened ' + dirFiles.length + ' file(s).']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^vim\s+(list|todo|tido|planner)\s*$/.test(raw)) {
+      var tasks = [];
+      try { tasks = JSON.parse(localStorage.getItem(TASKS_KEY) || '[]'); } catch (e) {}
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-date';
+      contentBox.style.minHeight = '200px';
+      var textarea = document.createElement('textarea');
+      textarea.placeholder = 'One task per line...';
+      textarea.style.cssText = 'width:100%;height:180px;resize:vertical;font-family:inherit;font-size:14px;padding:8px;border:1px solid #444;background:#2a2a2a;color:#e0e0e0;border-radius:4px;';
+      textarea.value = Array.isArray(tasks) ? tasks.join('\n') : '';
+      var saveBtn = document.createElement('button');
+      saveBtn.type = 'button';
+      saveBtn.textContent = 'Save';
+      saveBtn.style.cssText = 'margin-top:8px;padding:6px 14px;cursor:pointer;background:#0a7;color:#fff;border:none;border-radius:4px;';
+      saveBtn.addEventListener('click', function() {
+        var lines = textarea.value.split(/\n/).map(function(s) { return s.trim(); }).filter(Boolean);
+        try { localStorage.setItem(TASKS_KEY, JSON.stringify(lines)); } catch (e) {}
+      });
+      contentBox.appendChild(textarea);
+      contentBox.appendChild(saveBtn);
+      createPopupWindow('Tasks / To-do', contentBox, null, { width: 400, height: 280 });
+      appendOutput(raw, ['Opened tasks.']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var vimMatch = /^vim\s+(.+)$/.exec(raw);
+    if (vimMatch) {
+      var vimArg = vimMatch[1].trim();
+      var looksLikeUrl = /^https?:\/\//i.test(vimArg) || (/^[a-z0-9][-a-z0-9.]*\.[a-z0-9].*$/i.test(vimArg) && !/\s/.test(vimArg) && !/\.txt$/i.test(vimArg));
+      if (looksLikeUrl) {
+        var vimUrl = /^https?:\/\//i.test(vimArg) ? vimArg : 'https://' + vimArg;
+        var title = 'Website';
+        try { var va = document.createElement('a'); va.href = vimUrl; title = va.hostname || title; } catch (e) {}
+        var isGoogle = (title || '').indexOf('google') !== -1;
+        if (isGoogle) {
+          window.open(vimUrl, '_blank', 'noopener,noreferrer');
+          appendOutput(raw, ['Opened in new window.']);
+        } else {
+          var box = document.createElement('div');
+          box.style.cssText = 'flex:1;min-height:0;margin:-16px;padding:0;overflow:hidden;display:flex;flex-direction:column;';
+          var iframe = document.createElement('iframe');
+          iframe.src = vimUrl;
+          iframe.style.cssText = 'flex:1;width:100%;border:none;min-height:0;display:block;';
+          box.appendChild(iframe);
+          createPopupWindow(title, box, null, { width: 900, height: 700, minW: 400, minH: 300 });
+          appendOutput(raw, ['Opened in popup.']);
+        }
+      } else {
+        var cwd = getCwd();
+        var fullPath = resolvePath(cwd, vimArg);
+        var fs = getFs();
+        var e = getEntry(fs, fullPath);
+        if (e && e.type === 'dir') {
+          appendOutput(raw, ['vim: ' + vimArg + ': is a directory']);
+        } else {
+          openVimFileEditor(fullPath, vimArg);
+          appendOutput(raw, ['Opened ' + vimArg + ' in popup.']);
+        }
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var timerSecondsMatch = /^timer\s+-s\s+(\d+)\s*$/.exec(raw);
+    var timerMinutesMatch = /^timer\s+(\d+)\s*$/.exec(raw);
+    var timerNoArgMatch = /^timer\s*$/.exec(raw);
+    if (timerSecondsMatch || timerMinutesMatch || timerNoArgMatch) {
+      var totalSeconds = timerSecondsMatch
+        ? Math.max(1, parseInt(timerSecondsMatch[1], 10))
+        : timerMinutesMatch
+          ? Math.max(1, parseInt(timerMinutesMatch[1], 10)) * 60
+          : 5 * 60;
+      var isSeconds = !!timerSecondsMatch;
+      var remainingSeconds = totalSeconds;
+      var paused = false;
+      var intervalId = null;
+      function formatTime(s) {
+        var m = Math.floor(s / 60);
+        var sec = s % 60;
+        return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
+      }
+      function setParticlesPaused() {
+        if (window.updateParticleColors) window.updateParticleColors('single', '#3333cc');
+      }
+      function setParticlesFinished() {
+        if (window.updateParticleColors) window.updateParticleColors('single', '#cc3333');
+      }
+      function setParticlesDefault() {
+        if (window.updateParticleColors) window.updateParticleColors('default');
+      }
+      function particleColorFromProgress(ratio) {
+        var r, g, b;
+        if (ratio > 0.5) {
+          var t = (ratio - 0.5) * 2;
+          r = Math.round(201 + (72 - 201) * t);
+          g = Math.round(162 + (146 - 162) * t);
+          b = Math.round(39 + (72 - 39) * t);
+        } else {
+          var t = ratio * 2;
+          r = Math.round(204 + (201 - 204) * t);
+          g = Math.round(51 + (162 - 51) * t);
+          b = Math.round(51 + (39 - 51) * t);
+        }
+        r = Math.max(0, Math.min(255, r));
+        g = Math.max(0, Math.min(255, g));
+        b = Math.max(0, Math.min(255, b));
+        return '#' + [r, g, b].map(function(x) { return ('0' + x.toString(16)).slice(-2); }).join('');
+      }
+      function setParticlesFromProgress() {
+        var ratio = totalSeconds > 0 ? remainingSeconds / totalSeconds : 0;
+        if (window.updateParticleColors) window.updateParticleColors('single', particleColorFromProgress(ratio));
+      }
+      var contentBox = document.createElement('div');
+      contentBox.className = 'timer-popup';
+      var displayEl = document.createElement('div');
+      displayEl.className = 'timer-display';
+      displayEl.textContent = formatTime(remainingSeconds);
+      var progressTrack = document.createElement('div');
+      progressTrack.className = 'timer-progress-track';
+      var progressFill = document.createElement('div');
+      progressFill.className = 'timer-progress-fill';
+      progressFill.style.width = (remainingSeconds / totalSeconds * 100) + '%';
+      progressTrack.appendChild(progressFill);
+      function updateProgress() {
+        var pct = totalSeconds > 0 ? (remainingSeconds / totalSeconds) * 100 : 0;
+        progressFill.style.width = pct + '%';
+        progressFill.classList.remove('timer-low', 'timer-critical');
+        if (pct <= 25) progressFill.classList.add('timer-critical');
+        else if (pct <= 50) progressFill.classList.add('timer-low');
+      }
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'timer-btn';
+      btn.textContent = 'Pause';
+      setParticlesFromProgress();
+      function tick() {
+        if (paused) return;
+        remainingSeconds--;
+        displayEl.textContent = formatTime(remainingSeconds);
+        updateProgress();
+        setParticlesFromProgress();
+        if (remainingSeconds <= 0) {
+          clearInterval(intervalId);
+          intervalId = null;
+          displayEl.textContent = "Time's up!";
+          displayEl.classList.add('timer-finished');
+          btn.disabled = true;
+          btn.textContent = 'Done';
+          setParticlesFinished();
+        }
+      }
+      intervalId = setInterval(tick, 1000);
+      btn.addEventListener('click', function() {
+        if (remainingSeconds <= 0) return;
+        if (paused) {
+          paused = false;
+          btn.textContent = 'Pause';
+          btn.disabled = false;
+          setParticlesFromProgress();
+          intervalId = setInterval(tick, 1000);
+        } else {
+          paused = true;
+          clearInterval(intervalId);
+          intervalId = null;
+          btn.textContent = 'Resume';
+          setParticlesPaused();
+        }
+      });
+      var actionsWrap = document.createElement('div');
+      actionsWrap.className = 'timer-actions';
+      actionsWrap.appendChild(btn);
+      contentBox.appendChild(displayEl);
+      contentBox.appendChild(progressTrack);
+      contentBox.appendChild(actionsWrap);
+      createPopupWindow('Timer', contentBox, function() {
+        if (intervalId) clearInterval(intervalId);
+        setParticlesDefault();
+      }, { darkTheme: true });
+      var msg = isSeconds
+        ? ('Timer set for ' + totalSeconds + ' second' + (totalSeconds !== 1 ? 's' : ''))
+        : ('Timer set for ' + (totalSeconds / 60) + ' minute' + (totalSeconds !== 60 ? 's' : ''));
+      appendOutput(raw, [msg]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^(?:clock|time)\s*$/.test(raw)) {
+      var isAnalog = false;
+      var clockIntervalId = null;
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-clock';
+      var digitalDiv = document.createElement('div');
+      digitalDiv.className = 'clock-digital';
+      var analogDiv = document.createElement('div');
+      analogDiv.className = 'clock-analog';
+      analogDiv.style.display = 'none';
+      var canvas = document.createElement('canvas');
+      canvas.width = 160;
+      canvas.height = 160;
+      analogDiv.appendChild(canvas);
+      function updateDigital() {
+        var d = new Date();
+        var h = d.getHours();
+        var m = d.getMinutes();
+        var s = d.getSeconds();
+        var ampm = h >= 12 ? 'PM' : 'AM';
+        h = h % 12 || 12;
+        digitalDiv.textContent = (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s + ' ' + ampm;
+      }
+      function updateAnalog() {
+        var d = new Date();
+        var ctx = canvas.getContext('2d');
+        var cx = 80, cy = 80, r = 70;
+        ctx.clearRect(0, 0, 160, 160);
+        ctx.strokeStyle = 'rgba(0, 255, 255, 0.4)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+        for (var i = 0; i < 12; i++) {
+          var a = (i * 30 - 90) * Math.PI / 180;
+          var r1 = r - 8, r2 = r;
+          ctx.beginPath();
+          ctx.moveTo(cx + r1 * Math.cos(a), cy + r1 * Math.sin(a));
+          ctx.lineTo(cx + r2 * Math.cos(a), cy + r2 * Math.sin(a));
+          ctx.stroke();
+        }
+        var sec = d.getSeconds(), min = d.getMinutes(), hr = d.getHours() % 12 + min / 60;
+        var secA = (sec * 6 - 90) * Math.PI / 180;
+        var minA = (min * 6 - 90) * Math.PI / 180;
+        var hrA = (hr * 30 - 90) * Math.PI / 180;
+        ctx.strokeStyle = '#00ddcc';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + 45 * Math.cos(hrA), cy + 45 * Math.sin(hrA));
+        ctx.stroke();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#a0e8f0';
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + 55 * Math.cos(minA), cy + 55 * Math.sin(minA));
+        ctx.stroke();
+        ctx.strokeStyle = '#ff66aa';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + 60 * Math.cos(secA), cy + 60 * Math.sin(secA));
+        ctx.stroke();
+      }
+      function tick() {
+        if (isAnalog) updateAnalog(); else updateDigital();
+      }
+      updateDigital();
+      clockIntervalId = setInterval(tick, 1000);
+      var toggleBtn = document.createElement('button');
+      toggleBtn.className = 'clock-mode-toggle';
+      toggleBtn.type = 'button';
+      toggleBtn.style.marginTop = '12px';
+      toggleBtn.textContent = 'Analog';
+      toggleBtn.addEventListener('click', function() {
+        isAnalog = !isAnalog;
+        digitalDiv.style.display = isAnalog ? 'none' : 'block';
+        analogDiv.style.display = isAnalog ? 'block' : 'none';
+        toggleBtn.textContent = isAnalog ? 'Digital' : 'Analog';
+        tick();
+      });
+      contentBox.appendChild(digitalDiv);
+      contentBox.appendChild(analogDiv);
+      contentBox.appendChild(toggleBtn);
+      createPopupWindow('Clock', contentBox, function() { if (clockIntervalId) clearInterval(clockIntervalId); }, { width: 280, height: 200, topOffset: 80, leftOffset: 0 });
+      appendOutput(raw, []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^date\s*$/.test(raw)) {
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-date';
+      var format = 'DD-MM-YYYY';
+      var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+      var DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+      function ordinal(n) {
+        var s = n % 100;
+        if (s >= 11 && s <= 13) return n + 'th';
+        if (n % 10 === 1) return n + 'st';
+        if (n % 10 === 2) return n + 'nd';
+        if (n % 10 === 3) return n + 'rd';
+        return n + 'th';
+      }
+      function formatDate(fmt) {
+        var d = new Date();
+        var DD = ('0' + d.getDate()).slice(-2);
+        var MM = ('0' + (d.getMonth() + 1)).slice(-2);
+        var YYYY = d.getFullYear();
+        var Month = MONTHS[d.getMonth()];
+        var D = d.getDate();
+        var Day = DAYS[d.getDay()];
+        var Dth = ordinal(D);
+        if (fmt === 'DD-MM-YYYY') return DD + '-' + MM + '-' + YYYY;
+        if (fmt === 'MM-DD-YYYY') return MM + '-' + DD + '-' + YYYY;
+        if (fmt === 'YYYY-MM-DD') return YYYY + '-' + MM + '-' + DD;
+        if (fmt === 'Month D, YYYY') return Month + ' ' + D + ', ' + YYYY;
+        if (fmt === 'D Month YYYY') return D + ' ' + Month + ' ' + YYYY;
+        if (fmt === 'Weekday Dth Month') return Day + ' ' + Dth + ' ' + Month;
+        if (fmt === 'Weekday, Month Dth') return Day + ', ' + Month + ' ' + Dth;
+        if (fmt === 'Weekday, Month Dth YYYY') return Day + ', ' + Month + ' ' + Dth + ', ' + YYYY;
+        if (fmt === 'Weekday D Month YYYY') return Day + ' ' + D + ' ' + Month + ' ' + YYYY;
+        return DD + '-' + MM + '-' + YYYY;
+      }
+      var displayEl = document.createElement('div');
+      displayEl.className = 'date-display';
+      displayEl.textContent = formatDate(format);
+      var formatsList = [
+        ['DD-MM-YYYY', 'DD-MM-YYYY'],
+        ['MM-DD-YYYY', 'MM-DD-YYYY'],
+        ['YYYY-MM-DD', 'YYYY-MM-DD'],
+        ['Month D, YYYY', 'Month DOY, YYYY'],
+        ['D Month YYYY', 'DOY Month YYYY'],
+        ['Weekday Dth Month', 'Weekday DOY Month'],
+        ['Weekday, Month Dth', 'Weekday, Month DOY'],
+        ['Weekday, Month Dth YYYY', 'Weekday, Month DOY YYYY'],
+        ['Weekday D Month YYYY', 'Weekday DOY Month YYYY']
+      ];
+      var formatIndex = 0;
+      function setFormatByIndex(i) {
+        formatIndex = (i + formatsList.length) % formatsList.length;
+        format = formatsList[formatIndex][0];
+        displayEl.textContent = formatDate(format);
+        labelEl.textContent = formatsList[formatIndex][1];
+      }
+      var row = document.createElement('div');
+      row.className = 'date-format-row';
+      var leftBtn = document.createElement('button');
+      leftBtn.className = 'date-format-arrow';
+      leftBtn.type = 'button';
+      leftBtn.setAttribute('aria-label', 'Previous format');
+      leftBtn.innerHTML = '&#9664;';
+      leftBtn.addEventListener('click', function() { setFormatByIndex(formatIndex - 1); });
+      var labelEl = document.createElement('span');
+      labelEl.className = 'date-format-label';
+      labelEl.textContent = formatsList[formatIndex][1];
+      var rightBtn = document.createElement('button');
+      rightBtn.className = 'date-format-arrow';
+      rightBtn.type = 'button';
+      rightBtn.setAttribute('aria-label', 'Next format');
+      rightBtn.innerHTML = '&#9654;';
+      rightBtn.addEventListener('click', function() { setFormatByIndex(formatIndex + 1); });
+      row.appendChild(leftBtn);
+      row.appendChild(labelEl);
+      row.appendChild(rightBtn);
+      contentBox.appendChild(displayEl);
+      contentBox.appendChild(row);
+      createPopupWindow('Date', contentBox, null, { width: 320, height: 240, topOffset: 80, leftOffset: 0 });
+      appendOutput(raw, []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^calculator\s*$/.test(raw) || /^calc\s*$/.test(raw)) {
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-calc';
+      var display = document.createElement('input');
+      display.type = 'text';
+      display.readOnly = true;
+      display.className = 'calc-display';
+      display.value = '0';
+      var displayValue = '0';
+      var values = [];
+      var ops = [];
+      function updateDisplay() { display.value = displayValue; }
+      function evaluate() {
+        if (values.length === 0) return;
+        var v = values.slice();
+        var o = ops.slice();
+        var i;
+        while ((i = o.indexOf('*')) >= 0 || (i = o.indexOf('/')) >= 0) {
+          if (i < 0) i = o.indexOf('/');
+          var a = v[i], b = v[i + 1];
+          if (o[i] === '*') v[i] = a * b; else v[i] = b !== 0 ? a / b : NaN;
+          v.splice(i + 1, 1);
+          o.splice(i, 1);
+        }
+        while (o.length > 0) {
+          var a = v[0], b = v[1];
+          if (o[0] === '+') v[0] = a + b; else v[0] = a - b;
+          v.splice(1, 1);
+          o.splice(0, 1);
+        }
+        return v[0];
+      }
+      var btnValues = [['7', '8', '9', '/'], ['4', '5', '6', '*'], ['1', '2', '3', '-'], ['0', '.', '=', '+'], ['C']];
+      var grid = document.createElement('div');
+      grid.className = 'calc-grid';
+      btnValues.forEach(function(row) {
+        row.forEach(function(v) {
+          var btn = document.createElement('button');
+          btn.className = 'calc-btn';
+          btn.textContent = v;
+          if (v === 'C') btn.classList.add('calc-btn-c');
+          btn.addEventListener('click', function() {
+            if (v === 'C') {
+              displayValue = '0';
+              values = [];
+              ops = [];
+              updateDisplay();
+              return;
+            }
+            if (v === '=') {
+              var num = parseFloat(displayValue);
+              if (isNaN(num)) { updateDisplay(); return; }
+              values.push(num);
+              if (values.length === 1 && ops.length === 0) {
+                displayValue = String(values[0]);
+                values = [];
+              } else if (values.length === ops.length + 1) {
+                var result = evaluate();
+                if (isNaN(result)) displayValue = 'Error';
+                else displayValue = String(result);
+                values = [];
+                ops = [];
+              }
+              updateDisplay();
+              return;
+            }
+            if (['+', '-', '*', '/'].indexOf(v) >= 0) {
+              var num = parseFloat(displayValue);
+              if (!isNaN(num)) {
+                values.push(num);
+                ops.push(v);
+              }
+              displayValue = '0';
+              return;
+            }
+            if (v === '.' && displayValue.indexOf('.') >= 0) return;
+            if (displayValue === '0' && v !== '.') displayValue = v; else displayValue += v;
+            updateDisplay();
+          });
+          grid.appendChild(btn);
+        });
+      });
+      contentBox.appendChild(display);
+      contentBox.appendChild(grid);
+      createPopupWindow('Calculator', contentBox, null, { width: 300, height: 380, topOffset: 80, leftOffset: 0, minW: 260, minH: 320 });
+      appendOutput(raw, []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^calendar\s*$/.test(raw) || /^calender\s*$/.test(raw) || /^cal\s*$/.test(raw)) {
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-calendar';
+      var d = new Date();
+      var currentMonth = d.getMonth();
+      var currentYear = d.getFullYear();
+      var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+      var titleEl = document.createElement('div');
+      titleEl.className = 'calendar-title';
+      var gridEl = document.createElement('div');
+      gridEl.className = 'calendar-grid';
+      function render() {
+        titleEl.textContent = MONTHS[currentMonth] + ' ' + currentYear;
+        gridEl.innerHTML = '';
+        var header = document.createElement('div');
+        header.className = 'calendar-header';
+        ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].forEach(function(day) {
+          var c = document.createElement('span');
+          c.className = 'calendar-cell calendar-head';
+          c.textContent = day;
+          header.appendChild(c);
+        });
+        gridEl.appendChild(header);
+        var firstDay = new Date(currentYear, currentMonth, 1).getDay();
+        var daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+        var today = new Date();
+        var todayYear = today.getFullYear();
+        var todayMonth = today.getMonth();
+        var todayDate = today.getDate();
+        var row = document.createElement('div');
+        row.className = 'calendar-row';
+        for (var i = 0; i < firstDay; i++) {
+          var cell = document.createElement('span');
+          cell.className = 'calendar-cell calendar-empty';
+          cell.textContent = '\u00a0';
+          row.appendChild(cell);
+        }
+        for (var day = 1; day <= daysInMonth; day++) {
+          if (row.children.length === 7) {
+            gridEl.appendChild(row);
+            row = document.createElement('div');
+            row.className = 'calendar-row';
+          }
+          var cell = document.createElement('span');
+          cell.className = 'calendar-cell';
+          if (currentYear === todayYear && currentMonth === todayMonth && day === todayDate) {
+            cell.classList.add('calendar-today');
+          }
+          cell.textContent = day;
+          row.appendChild(cell);
+        }
+        while (row.children.length < 7) {
+          var cell = document.createElement('span');
+          cell.className = 'calendar-cell calendar-empty';
+          cell.textContent = '\u00a0';
+          row.appendChild(cell);
+        }
+        gridEl.appendChild(row);
+      }
+      render();
+      var nav = document.createElement('div');
+      nav.className = 'calendar-nav';
+      var prevBtn = document.createElement('button');
+      prevBtn.className = 'timer-btn';
+      prevBtn.textContent = '\u2190';
+      prevBtn.addEventListener('click', function() {
+        currentMonth--;
+        if (currentMonth < 0) { currentMonth = 11; currentYear--; }
+        render();
+      });
+      var todayBtn = document.createElement('button');
+      todayBtn.className = 'calendar-today-btn';
+      todayBtn.title = 'Go to today';
+      todayBtn.textContent = '\u2302';
+      todayBtn.addEventListener('click', function() {
+        var t = new Date();
+        currentMonth = t.getMonth();
+        currentYear = t.getFullYear();
+        render();
+      });
+      var nextBtn = document.createElement('button');
+      nextBtn.className = 'timer-btn';
+      nextBtn.textContent = '\u2192';
+      nextBtn.addEventListener('click', function() {
+        currentMonth++;
+        if (currentMonth > 11) { currentMonth = 0; currentYear++; }
+        render();
+      });
+      nav.appendChild(prevBtn);
+      nav.appendChild(todayBtn);
+      nav.appendChild(nextBtn);
+      contentBox.appendChild(titleEl);
+      contentBox.appendChild(gridEl);
+      contentBox.appendChild(nav);
+      createPopupWindow('Calendar', contentBox, null, { width: 320, height: 360, topOffset: 80, leftOffset: 0, minW: 280, minH: 320 });
+      appendOutput(raw, []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^(?:battery|charge)\s*$/.test(raw)) {
+      appendOutput(raw, []);
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-battery';
+      var statusEl = document.createElement('div');
+      statusEl.className = 'battery-status';
+      var pctEl = document.createElement('div');
+      pctEl.className = 'battery-pct';
+      var barWrap = document.createElement('div');
+      barWrap.className = 'battery-bar-wrap';
+      var barFill = document.createElement('div');
+      barFill.className = 'battery-bar-fill';
+      barWrap.appendChild(barFill);
+      var labelEl = document.createElement('div');
+      labelEl.className = 'battery-label';
+      contentBox.appendChild(statusEl);
+      contentBox.appendChild(pctEl);
+      contentBox.appendChild(barWrap);
+      contentBox.appendChild(labelEl);
+      function updateBattery(b) {
+        var pct = b ? Math.round(b.level * 100) : 0;
+        var charging = b ? b.charging : false;
+        var timeLeft = b && !charging && b.dischargingTime !== Infinity ? Math.round(b.dischargingTime / 60) : null;
+        var timeFull = b && charging && b.chargingTime !== Infinity ? Math.round(b.chargingTime / 60) : null;
+        pctEl.textContent = pct + '%';
+        barFill.style.width = pct + '%';
+        barFill.classList.remove('battery-low', 'battery-critical', 'battery-charging');
+        if (charging) barFill.classList.add('battery-charging');
+        else if (pct <= 15) barFill.classList.add('battery-critical');
+        else if (pct <= 25) barFill.classList.add('battery-low');
+        statusEl.textContent = charging ? 'Charging' : (pct <= 15 ? 'Low' : 'Not charging');
+        if (charging && timeFull != null) labelEl.textContent = 'Full in ~' + timeFull + ' min';
+        else if (!charging && timeLeft != null) labelEl.textContent = '~' + timeLeft + ' min remaining';
+        else labelEl.textContent = charging ? 'Calculating...' : '';
+      }
+      if (navigator.getBattery) {
+        navigator.getBattery().then(function(b) {
+          updateBattery(b);
+          b.addEventListener('chargingchange', function() { updateBattery(b); });
+          b.addEventListener('levelchange', function() { updateBattery(b); });
+          b.addEventListener('chargingtimechange', function() { updateBattery(b); });
+          b.addEventListener('dischargingtimechange', function() { updateBattery(b); });
+        }).catch(function() {
+          statusEl.textContent = 'Unavailable';
+          pctEl.textContent = '-';
+          labelEl.textContent = 'Battery API not supported or denied';
+        });
+      } else {
+        statusEl.textContent = 'Unavailable';
+        pctEl.textContent = '-';
+        labelEl.textContent = 'Battery API not supported';
+      }
+      createPopupWindow('Battery', contentBox, null, { width: 320, height: 240, topOffset: 80, leftOffset: 0, minW: 280, minH: 200 });
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^(?:temperature|temp|hot|cold)\s*$/.test(raw)) {
+      appendOutput(raw, []);
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-temperature';
+      var loadingEl = document.createElement('div');
+      loadingEl.className = 'temp-loading';
+      loadingEl.textContent = 'Getting temperature...';
+      var labelEl = document.createElement('div');
+      labelEl.className = 'temp-label';
+      labelEl.textContent = 'Outside';
+      var valueEl = document.createElement('div');
+      valueEl.className = 'temp-value';
+      var unitEl = document.createElement('div');
+      unitEl.className = 'temp-unit';
+      unitEl.textContent = '\u00b0C';
+      var textWrap = document.createElement('div');
+      textWrap.className = 'temp-text-wrap';
+      textWrap.appendChild(valueEl);
+      textWrap.appendChild(unitEl);
+      var thermoWrap = document.createElement('div');
+      thermoWrap.className = 'temp-thermo-wrap';
+      thermoWrap.title = 'Tap to switch \u00b0C / \u00b0F';
+      var thermoTube = document.createElement('div');
+      thermoTube.className = 'temp-thermo-tube';
+      var thermoFill = document.createElement('div');
+      thermoFill.className = 'temp-thermo-fill';
+      thermoTube.appendChild(thermoFill);
+      var thermoBulb = document.createElement('div');
+      thermoBulb.className = 'temp-thermo-bulb';
+      thermoWrap.appendChild(thermoTube);
+      thermoWrap.appendChild(thermoBulb);
+      var displayRow = document.createElement('div');
+      displayRow.className = 'temp-display-row';
+      displayRow.appendChild(textWrap);
+      displayRow.appendChild(thermoWrap);
+      var hintEl = document.createElement('div');
+      hintEl.className = 'temp-thermo-hint';
+      hintEl.textContent = 'Tap thermometer for \u00b0F / \u00b0C';
+      contentBox.appendChild(loadingEl);
+      contentBox.appendChild(labelEl);
+      contentBox.appendChild(displayRow);
+      contentBox.appendChild(hintEl);
+      contentBox.classList.add('popup-temperature--loading');
+      createPopupWindow('Temperature', contentBox, null, { width: 280, height: 300, topOffset: 80, leftOffset: 0, minW: 240, minH: 260 });
+      var tempC = null;
+      var useCelsius = true;
+      function updateDisplay() {
+        if (tempC == null) return;
+        var minC = -10, maxC = 50;
+        var pct = Math.max(0, Math.min(100, ((tempC - minC) / (maxC - minC)) * 100));
+        thermoFill.style.height = pct + '%';
+        if (useCelsius) {
+          valueEl.textContent = Math.round(tempC * 10) / 10;
+          unitEl.textContent = '\u00b0C';
+        } else {
+          var f = tempC * 9 / 5 + 32;
+          valueEl.textContent = Math.round(f * 10) / 10;
+          unitEl.textContent = '\u00b0F';
+        }
+      }
+      thermoWrap.addEventListener('click', function() {
+        if (tempC == null) return;
+        useCelsius = !useCelsius;
+        updateDisplay();
+      });
+      function showTempOnly(c) {
+        loadingEl.style.display = 'none';
+        contentBox.classList.remove('popup-temperature--loading');
+        tempC = c;
+        updateDisplay();
+      }
+      function tryFetchTemp(lat, lon) {
+        var url = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon + '&current=temperature_2m';
+        fetch(url).then(function(r) { return r.json(); }).then(function(data) {
+          var cur = data.current;
+          if (cur && typeof cur.temperature_2m === 'number') {
+            showTempOnly(cur.temperature_2m);
+          } else {
+            loadingEl.textContent = 'Temperature unavailable';
+          }
+        }).catch(function() {
+          loadingEl.textContent = 'Could not fetch temperature';
+        });
+      }
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          function(pos) { tryFetchTemp(pos.coords.latitude, pos.coords.longitude); },
+          function() { tryFetchTemp(-33.8688, 151.2093); }
+        );
+      } else {
+        tryFetchTemp(-33.8688, 151.2093);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^weather\s*$/.test(raw)) {
+      appendOutput(raw, []);
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-weather';
+      var loadingEl = document.createElement('div');
+      loadingEl.className = 'weather-loading';
+      loadingEl.textContent = 'Getting weather...';
+      var imgEl = document.createElement('img');
+      imgEl.className = 'weather-icon';
+      imgEl.alt = '';
+      var descEl = document.createElement('div');
+      descEl.className = 'weather-desc';
+      var detailsEl = document.createElement('div');
+      detailsEl.className = 'weather-details';
+      contentBox.appendChild(loadingEl);
+      contentBox.appendChild(imgEl);
+      contentBox.appendChild(descEl);
+      contentBox.appendChild(detailsEl);
+      createPopupWindow('Weather', contentBox, null, { width: 320, height: 420, topOffset: 80, leftOffset: 0, minW: 280, minH: 380 });
+      function weatherCodeToImage(code, windSpeed) {
+        if (windSpeed >= 40) return 'windy.png';
+        if (code === 0) return 'clear.png';
+        if (code === 1) return 'mostly_clear.png';
+        if (code === 2) return 'partly_cloudy.png';
+        if (code === 3) return 'overcast.png';
+        if (code === 45 || code === 48) return 'fog.png';
+        if (code === 51 || code === 52 || code === 53 || code === 56 || code === 57 || code === 61 || code === 63 || code === 65 || code === 66 || code === 67 || code === 80 || code === 81 || code === 82) return 'rain.png';
+        if (code === 71 || code === 73 || code === 75 || code === 77 || code === 85 || code === 86) return 'snow.png';
+        if (code === 68 || code === 69 || code === 83 || code === 84) return 'sleet.png';
+        if (code === 95) return 'thunderstorm.png';
+        if (code === 96 || code === 99) return 'severe_storm.png';
+        if (code === 55 || code === 56 || code === 57) return 'haze.png';
+        return 'partly_cloudy.png';
+      }
+      function weatherCodeToDesc(code) {
+        var d = { 0: 'Clear', 1: 'Mostly clear', 2: 'Partly cloudy', 3: 'Overcast', 45: 'Foggy', 48: 'Rime fog', 51: 'Light drizzle', 52: 'Drizzle', 53: 'Dense drizzle', 56: 'Freezing drizzle', 57: 'Dense freezing drizzle', 61: 'Slight rain', 63: 'Rain', 65: 'Heavy rain', 66: 'Light freezing rain', 67: 'Freezing rain', 71: 'Slight snow', 73: 'Snow', 75: 'Heavy snow', 77: 'Snow grains', 80: 'Slight rain showers', 81: 'Rain showers', 82: 'Heavy rain showers', 83: 'Slight snow showers', 84: 'Snow showers', 85: 'Slight snow showers', 86: 'Heavy snow showers', 95: 'Thunderstorm', 96: 'Thunderstorm with hail', 99: 'Severe thunderstorm' };
+        return d[code] || 'Unknown';
+      }
+      function showWeather(data, locationLabel) {
+        loadingEl.style.display = 'none';
+        var cur = data.current;
+        var code = cur.weather_code || 0;
+        var windSpeed = cur.wind_speed_10m;
+        descEl.textContent = weatherCodeToDesc(code);
+        imgEl.src = chrome.runtime.getURL('assets/weather/' + weatherCodeToImage(code, windSpeed));
+        imgEl.style.display = 'block';
+        var lines = [];
+        if (locationLabel) {
+          lines.push('Location: ' + locationLabel);
+        }
+        if (data.hourly && data.hourly.precipitation_probability && data.hourly.precipitation_probability[0] != null) {
+          lines.push('Chance of rain: ' + data.hourly.precipitation_probability[0] + '%');
+        }
+        if (cur.precipitation != null) {
+          lines.push('Precipitation: ' + cur.precipitation + ' mm');
+        }
+        if (cur.cloud_cover != null) {
+          lines.push('Cloud cover: ' + cur.cloud_cover + '%');
+        }
+        if (cur.relative_humidity_2m != null) {
+          lines.push('Humidity: ' + cur.relative_humidity_2m + '%');
+        }
+        if (cur.wind_speed_10m != null) {
+          lines.push('Wind: ' + cur.wind_speed_10m + ' km/h');
+        }
+        if (cur.pressure_msl != null) {
+          lines.push('Pressure: ' + Math.round(cur.pressure_msl) + ' hPa');
+        }
+        detailsEl.innerHTML = '';
+        lines.forEach(function(line) {
+          var p = document.createElement('div');
+          p.className = 'weather-detail-line';
+          p.textContent = line;
+          detailsEl.appendChild(p);
+        });
+      }
+      function tryFetchWeather(lat, lon, locationLabel) {
+        var url = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon + '&current=weather_code,precipitation,relative_humidity_2m,cloud_cover,wind_speed_10m,pressure_msl&hourly=precipitation_probability';
+        fetch(url).then(function(r) { return r.json(); }).then(function(data) {
+          if (data.current && data.current.weather_code != null) {
+            showWeather(data, locationLabel);
+          } else {
+            loadingEl.textContent = 'Weather unavailable';
+          }
+        }).catch(function() {
+          loadingEl.textContent = 'Could not fetch weather';
+        });
+      }
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          function(pos) { tryFetchWeather(pos.coords.latitude, pos.coords.longitude, 'Your location'); },
+          function() { tryFetchWeather(-33.8688, 151.2093, 'Sydney, Australia (default)'); }
+        );
+      } else {
+        tryFetchWeather(-33.8688, 151.2093, 'Sydney, Australia (default)');
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^location\s*$/.test(raw)) {
+      appendOutput(raw, []);
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-location';
+      contentBox.addEventListener('mousedown', function(e) { e.stopPropagation(); });
+      contentBox.addEventListener('click', function(e) { e.stopPropagation(); });
+      var mapWrap = document.createElement('div');
+      mapWrap.className = 'location-map-wrap';
+      mapWrap.id = 'popup-location-map-wrap';
+      var mapDiv = document.createElement('div');
+      mapDiv.id = 'popup-location-map';
+      mapDiv.className = 'location-map';
+      mapWrap.appendChild(mapDiv);
+      var row = document.createElement('div');
+      row.className = 'location-coords-row';
+      var latInput = document.createElement('input');
+      latInput.type = 'text';
+      latInput.placeholder = 'Latitude';
+      latInput.className = 'location-input';
+      latInput.value = '';
+      var lonInput = document.createElement('input');
+      lonInput.type = 'text';
+      lonInput.placeholder = 'Longitude';
+      lonInput.className = 'location-input';
+      lonInput.value = '';
+      var goBtn = document.createElement('button');
+      goBtn.type = 'button';
+      goBtn.className = 'location-btn';
+      goBtn.textContent = 'Go';
+      var myLocBtn = document.createElement('button');
+      myLocBtn.type = 'button';
+      myLocBtn.className = 'location-btn';
+      myLocBtn.textContent = 'My location';
+      row.appendChild(latInput);
+      row.appendChild(lonInput);
+      row.appendChild(goBtn);
+      row.appendChild(myLocBtn);
+      contentBox.appendChild(mapWrap);
+      contentBox.appendChild(row);
+      var popupResult = createPopupWindow('Location', contentBox, null, { width: 420, height: 380, topOffset: 80, leftOffset: 0, minW: 360, minH: 320 });
+      var mapObj = null;
+      var markerObj = null;
+      var defaultLat = -33.8688;
+      var defaultLon = 151.2093;
+      function setView(lat, lon) {
+        lat = parseFloat(lat);
+        lon = parseFloat(lon);
+        if (isNaN(lat) || isNaN(lon)) return;
+        lat = Math.max(-90, Math.min(90, lat));
+        lon = Math.max(-180, Math.min(180, lon));
+        latInput.value = lat;
+        lonInput.value = lon;
+        if (mapObj) {
+          mapObj.setView([lat, lon], mapObj.getZoom());
+          if (markerObj) markerObj.setLatLng([lat, lon]);
+          else markerObj = (typeof L !== 'undefined' && L.marker) ? L.marker([lat, lon]).addTo(mapObj) : null;
+        }
+      }
+      function initMap(lat, lon) {
+        if (typeof L === 'undefined') return;
+        if (mapObj) { mapObj.remove(); mapObj = null; markerObj = null; }
+        mapObj = L.map('popup-location-map').setView([lat, lon], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' }).addTo(mapObj);
+        markerObj = L.marker([lat, lon]).addTo(mapObj);
+        requestAnimationFrame(function() {
+          if (mapObj) mapObj.invalidateSize();
+        });
+      }
+      function onMapResize() {
+        if (mapObj) mapObj.invalidateSize();
+      }
+      function loadLeafletAndInit(lat, lon) {
+        // Leaflet is packaged under vendor/ and loaded from newtab.html.
+        // WAS: dynamically fetched from unpkg — blocked by MV3 CSP.
+        if (typeof L === 'undefined') {
+          console.error('Leaflet failed to load from vendor/leaflet/');
+          return;
+        }
+        L.Icon.Default.imagePath = chrome.runtime.getURL('vendor/leaflet/images') + '/';
+        initMap(lat, lon);
+      }
+      goBtn.addEventListener('click', function() {
+        var lat = parseFloat(latInput.value);
+        var lon = parseFloat(lonInput.value);
+        if (!isNaN(lat) && !isNaN(lon)) setView(lat, lon);
+      });
+      myLocBtn.addEventListener('click', function() {
+        if (navigator.geolocation) {
+          navigator.geolocation.getCurrentPosition(
+            function(p) { setView(p.coords.latitude, p.coords.longitude); },
+            function() { setView(defaultLat, defaultLon); }
+          );
+        } else {
+          setView(defaultLat, defaultLon);
+        }
+      });
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          function(p) {
+            var lat = p.coords.latitude;
+            var lon = p.coords.longitude;
+            latInput.value = lat;
+            lonInput.value = lon;
+            loadLeafletAndInit(lat, lon);
+          },
+          function() {
+            latInput.value = defaultLat;
+            lonInput.value = defaultLon;
+            loadLeafletAndInit(defaultLat, defaultLon);
+          }
+        );
+      } else {
+        latInput.value = defaultLat;
+        lonInput.value = defaultLon;
+        loadLeafletAndInit(defaultLat, defaultLon);
+      }
+      var resizeObs = new ResizeObserver(function() { onMapResize(); });
+      if (popupResult.win) resizeObs.observe(popupResult.win);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var scratchMatch = /^(?:scratch|scratchpad|notes|board|write)\s*$/i.test(raw);
+    var whiteboardMatch = /^whiteboard\s*$/i.test(raw);
+    var blackboardMatch = /^blackboard\s*$/i.test(raw);
+    if (scratchMatch || whiteboardMatch || blackboardMatch) {
+      appendOutput(raw, []);
+      var theme = whiteboardMatch ? 'whiteboard' : (blackboardMatch ? 'blackboard' : 'scratch');
+      var bg = theme === 'whiteboard' ? '#ffffff' : (theme === 'blackboard' ? '#1a1a1a' : '#e8e8e8');
+      var ink = theme === 'whiteboard' ? '#000000' : (theme === 'blackboard' ? '#ffffff' : '#333333');
+      var title = theme === 'whiteboard' ? 'Whiteboard' : (theme === 'blackboard' ? 'Blackboard' : 'Scratch pad');
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-scratch popup-scratch--' + theme;
+      contentBox.addEventListener('mousedown', function(e) { e.stopPropagation(); });
+      contentBox.addEventListener('click', function(e) { e.stopPropagation(); });
+      var toolbar = document.createElement('div');
+      toolbar.className = 'scratch-toolbar';
+      var pencilBtn = document.createElement('button');
+      pencilBtn.type = 'button';
+      pencilBtn.className = 'scratch-tool-btn scratch-tool--active';
+      pencilBtn.textContent = 'Pencil';
+      pencilBtn.title = 'Draw';
+      var eraserBtn = document.createElement('button');
+      eraserBtn.type = 'button';
+      eraserBtn.className = 'scratch-tool-btn';
+      eraserBtn.textContent = 'Eraser';
+      eraserBtn.title = 'Erase';
+      var clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'scratch-clear-btn';
+      clearBtn.textContent = 'Clear';
+      toolbar.appendChild(pencilBtn);
+      toolbar.appendChild(eraserBtn);
+      toolbar.appendChild(clearBtn);
+      var canvas = document.createElement('canvas');
+      canvas.className = 'scratch-canvas';
+      contentBox.appendChild(toolbar);
+      contentBox.appendChild(canvas);
+      var popup = createPopupWindow(title, contentBox, null, { width: 500, height: 400, topOffset: 80, leftOffset: 0, minW: 320, minH: 280 });
+      var ctx = canvas.getContext('2d');
+      var drawing = false;
+      var lastX = 0, lastY = 0;
+      var currentTool = 'pencil';
+      var eraserSize = 20;
+      function resizeCanvas() {
+        if (!contentBox || !canvas || !toolbar || !popup || !popup.win) return;
+        var winR = popup.win.getBoundingClientRect();
+        var titleBarH = 44;
+        var pad = 16;
+        var toolbarH = toolbar.getBoundingClientRect().height || 44;
+        var w = Math.max(100, Math.floor((winR.width || 500) - pad * 2));
+        var h = Math.max(100, Math.floor((winR.height || 400) - titleBarH - pad * 2 - toolbarH));
+        var oldW = canvas.width;
+        var oldH = canvas.height;
+        if (canvas.width !== w || canvas.height !== h) {
+          var imageData = null;
+          if (oldW > 0 && oldH > 0) {
+            try {
+              imageData = ctx.getImageData(0, 0, oldW, oldH);
+            } catch (err) {}
+          }
+          canvas.width = w;
+          canvas.height = h;
+          canvas.style.width = w + 'px';
+          canvas.style.height = h + 'px';
+          ctx.fillStyle = bg;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          if (imageData && imageData.data) {
+            var temp = document.createElement('canvas');
+            temp.width = oldW;
+            temp.height = oldH;
+            var tCtx = temp.getContext('2d');
+            tCtx.putImageData(imageData, 0, 0);
+            ctx.drawImage(temp, 0, 0, oldW, oldH, 0, 0, w, h);
+          }
+        }
+      }
+      function draw(x, y) {
+        if (!drawing) return;
+        ctx.lineCap = 'round';
+        if (currentTool === 'eraser') {
+          ctx.strokeStyle = bg;
+          ctx.lineWidth = eraserSize;
+        } else {
+          ctx.strokeStyle = ink;
+          ctx.lineWidth = 2;
+        }
+        ctx.beginPath();
+        ctx.moveTo(lastX, lastY);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+        lastX = x;
+        lastY = y;
+      }
+      function getPos(e) {
+        var r = canvas.getBoundingClientRect();
+        var scaleX = canvas.width / r.width;
+        var scaleY = canvas.height / r.height;
+        var clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        var clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        return { x: (clientX - r.left) * scaleX, y: (clientY - r.top) * scaleY };
+      }
+      clearBtn.addEventListener('click', function() {
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      });
+      pencilBtn.addEventListener('click', function() {
+        currentTool = 'pencil';
+        pencilBtn.classList.add('scratch-tool--active');
+        eraserBtn.classList.remove('scratch-tool--active');
+      });
+      eraserBtn.addEventListener('click', function() {
+        currentTool = 'eraser';
+        eraserBtn.classList.add('scratch-tool--active');
+        pencilBtn.classList.remove('scratch-tool--active');
+      });
+      canvas.addEventListener('mousedown', function(e) {
+        e.preventDefault();
+        var p = getPos(e);
+        lastX = p.x; lastY = p.y;
+        drawing = true;
+      });
+      canvas.addEventListener('mousemove', function(e) {
+        e.preventDefault();
+        draw(getPos(e).x, getPos(e).y);
+      });
+      canvas.addEventListener('mouseup', function() { drawing = false; });
+      canvas.addEventListener('mouseleave', function() { drawing = false; });
+      canvas.addEventListener('touchstart', function(e) {
+        e.preventDefault();
+        var p = getPos(e);
+        lastX = p.x; lastY = p.y;
+        drawing = true;
+      }, { passive: false });
+      canvas.addEventListener('touchmove', function(e) {
+        e.preventDefault();
+        draw(getPos(e).x, getPos(e).y);
+      }, { passive: false });
+      canvas.addEventListener('touchend', function() { drawing = false; });
+      requestAnimationFrame(function() {
+        resizeCanvas();
+        var ro = new ResizeObserver(function() { resizeCanvas(); });
+        if (popup.win) ro.observe(popup.win);
+        setTimeout(resizeCanvas, 0);
+        setTimeout(resizeCanvas, 50);
+        setTimeout(resizeCanvas, 200);
+      });
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (/^big\s*$/.test(raw)) {
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-bigtype';
+      var displayEl = document.createElement('div');
+      displayEl.className = 'bigtype-display';
+      displayEl.textContent = 'Type here';
+      var bigInput = document.createElement('input');
+      bigInput.type = 'text';
+      bigInput.className = 'bigtype-input';
+      bigInput.placeholder = 'Write something...';
+      bigInput.autocomplete = 'off';
+      function fitBigText() {
+        var text = bigInput.value || bigInput.placeholder;
+        displayEl.textContent = bigInput.value || bigInput.placeholder;
+        if (!bigInput.value) displayEl.classList.add('bigtype-display--placeholder');
+        else displayEl.classList.remove('bigtype-display--placeholder');
+        var maxW = contentBox.clientWidth - 24;
+        if (maxW <= 0) return;
+        var size = 120;
+        displayEl.style.fontSize = size + 'px';
+        while (displayEl.scrollWidth > maxW && size > 14) {
+          size -= 2;
+          displayEl.style.fontSize = size + 'px';
+        }
+      }
+      bigInput.addEventListener('input', fitBigText);
+      contentBox.appendChild(displayEl);
+      contentBox.appendChild(bigInput);
+      var bigPopup = createPopupWindow('Big Typer', contentBox, null, { width: 640, height: 220, topOffset: 80, leftOffset: 0, minW: 320, minH: 160 });
+      requestAnimationFrame(function() {
+        fitBigText();
+        bigInput.focus();
+      });
+      if (bigPopup && bigPopup.win) {
+        var ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(fitBigText) : null;
+        if (ro) ro.observe(bigPopup.win);
+      }
+      appendOutput(raw, ['Opened big typer.']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var randomPickMatch = /^random\s+-pick\s+(.+)$/.exec(raw);
+    var randomDoubleMatch = /^random\s+-d\s*$/.exec(raw);
+    var randomRangeMatch = /^random\s+(\d+)\s+(\d+)\s*$/.exec(raw);
+    var randomSingleMatch = /^random\s+(\d+)\s*$/.exec(raw);
+    var randomNoArgMatch = /^random\s*$/.exec(raw);
+    if (randomPickMatch) {
+      var items = randomPickMatch[1].trim().split(/\s+/).filter(Boolean);
+      var picked = items.length ? items[Math.floor(Math.random() * items.length)] : '';
+      appendOutput(raw, [picked || '(no items)']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (randomDoubleMatch) {
+      var d = Math.random();
+      appendOutput(raw, [String(d)]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (randomRangeMatch) {
+      var a = parseInt(randomRangeMatch[1], 10);
+      var b = parseInt(randomRangeMatch[2], 10);
+      if (a > b) { var t = a; a = b; b = t; }
+      var n = a + Math.floor(Math.random() * (b - a + 1));
+      appendOutput(raw, [String(n)]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (randomSingleMatch) {
+      var max = Math.max(1, parseInt(randomSingleMatch[1], 10));
+      var n = 1 + Math.floor(Math.random() * max);
+      appendOutput(raw, [String(n)]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (randomNoArgMatch) {
+      var contentBox = document.createElement('div');
+      contentBox.className = 'popup-random';
+      contentBox.addEventListener('mousedown', function(e) { e.stopPropagation(); });
+      contentBox.addEventListener('click', function(e) { e.stopPropagation(); });
+      var titleEl = document.createElement('div');
+      titleEl.className = 'random-title';
+      titleEl.textContent = 'Random';
+      var resultEl = document.createElement('div');
+      resultEl.className = 'random-result';
+      resultEl.textContent = '\u2014';
+      var btn120 = document.createElement('button');
+      btn120.type = 'button';
+      btn120.className = 'random-btn';
+      btn120.textContent = 'Random Number 1\u201320';
+      btn120.addEventListener('click', function() { resultEl.textContent = String(1 + Math.floor(Math.random() * 20)); });
+      var btnDouble = document.createElement('button');
+      btnDouble.type = 'button';
+      btnDouble.className = 'random-btn';
+      btnDouble.textContent = '0\u20131 double';
+      btnDouble.addEventListener('click', function() { resultEl.textContent = Math.random().toFixed(5); });
+      var rangeWrap = document.createElement('div');
+      rangeWrap.className = 'random-range-wrap';
+      var rangeFrom = document.createElement('input');
+      rangeFrom.type = 'number';
+      rangeFrom.placeholder = 'From';
+      rangeFrom.className = 'random-input';
+      rangeFrom.value = '1';
+      var rangeTo = document.createElement('input');
+      rangeTo.type = 'number';
+      rangeTo.placeholder = 'To';
+      rangeTo.className = 'random-input';
+      rangeTo.value = '100';
+      var rangeBtn = document.createElement('button');
+      rangeBtn.type = 'button';
+      rangeBtn.className = 'random-btn';
+      rangeBtn.textContent = 'Generate';
+      rangeBtn.addEventListener('click', function() {
+        var from = parseInt(rangeFrom.value, 10);
+        var to = parseInt(rangeTo.value, 10);
+        if (isNaN(from)) from = 1;
+        if (isNaN(to)) to = 100;
+        if (from > to) { var t = from; from = to; to = t; }
+        resultEl.textContent = String(from + Math.floor(Math.random() * (to - from + 1)));
+      });
+      rangeWrap.appendChild(rangeFrom);
+      rangeWrap.appendChild(rangeTo);
+      rangeWrap.appendChild(rangeBtn);
+      contentBox.appendChild(titleEl);
+      contentBox.appendChild(resultEl);
+      contentBox.appendChild(btn120);
+      contentBox.appendChild(btnDouble);
+      contentBox.appendChild(rangeWrap);
+      createPopupWindow('Random', contentBox, null, { width: 300, height: 320, topOffset: 80, leftOffset: 0 });
+      appendOutput(raw, []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (historyMatch) {
+      appendOutput('history', commandHistory.slice());
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (historyLMatch) {
+      var n = parseInt(historyLMatch[1], 10);
+      var lastN = isNaN(n) || n < 1 ? 5 : Math.min(n, commandHistory.length);
+      var lines = commandHistory.slice(-lastN);
+      appendOutput(raw, lines);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var ipMatch = /^ip\s*$/.exec(raw);
+    if (ipMatch) {
+      appendOutput('ip', []);
+      input.value = '';
+      hideTabOptions();
+      fetch('https://api.ipify.org?format=json').then(function(r) { return r.json(); }).then(function(d) {
+        appendResultLine(d.ip || '');
+      }).catch(function() {
+        appendResultLine('Could not get IP');
+      });
+      return;
+    }
+    var whoamiMatch = /^whoami\s*$/.exec(raw);
+    if (whoamiMatch) {
+      appendOutput('whoami', ['Yash Jain']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var mailMatch = /^mail\s*$/.exec(raw);
+    var outlookMatch = /^outlook\s*$/.exec(raw);
+    var githubMatch = /^github\s*$/.exec(raw);
+    var driveMatch = /^drive\s*$/.exec(raw);
+    var docsMatch = /^docs\s*$/.exec(raw);
+    var slidesMatch = /^slides\s*$/.exec(raw);
+    var sheetsMatch = /^sheets\s*$/.exec(raw);
+    var websiteMatch = /^website\s*$/.exec(raw);
+    var utexasMatch = /^utexas\s*$/.exec(raw);
+    var canvasMatch = /^canvas\s*$/.exec(raw);
+    if (/^d\s*$/.test(raw)) {
+      appendOutput('d', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://drive.google.com/');
+      return;
+    }
+    if (/^u\s*$/.test(raw)) {
+      appendOutput('u', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://utexas.instructure.com/');
+      return;
+    }
+    if (/^m\s*$/.test(raw)) {
+      appendOutput('m', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://mail.google.com/');
+      return;
+    }
+    if (/^s\s*$/.test(raw)) {
+      appendOutput('s', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://sheets.google.com/');
+      return;
+    }
+    if (/^g\s*$/.test(raw)) {
+      appendOutput('g', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://github.com');
+      return;
+    }
+    if (/^o\s*$/.test(raw)) {
+      appendOutput('o', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://outlook.office.com/mail/?culture=en-us&country=us');
+      return;
+    }
+    if (/^chat\s*$/.test(raw)) {
+      appendOutput('chat', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://chatgpt.com/');
+      return;
+    }
+    if (websiteMatch) {
+      appendOutput('website', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://yashj1579.github.io/');
+      return;
+    }
+    if (utexasMatch || canvasMatch) {
+      appendOutput(raw, []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://utexas.instructure.com/');
+      return;
+    }
+    if (driveMatch) {
+      appendOutput('drive', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://drive.google.com/');
+      return;
+    }
+    if (docsMatch) {
+      appendOutput('docs', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://docs.google.com/');
+      return;
+    }
+    if (slidesMatch) {
+      appendOutput('slides', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://slides.google.com/');
+      return;
+    }
+    if (sheetsMatch) {
+      appendOutput('sheets', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://sheets.google.com/');
+      return;
+    }
+    var linkedinMatch = /^linkedin\s*$/.exec(raw);
+    if (linkedinMatch) {
+      appendOutput('linkedin', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://www.linkedin.com/in/yashjain-aus');
+      return;
+    }
+    if (githubMatch) {
+      appendOutput('github', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://github.com');
+      return;
+    }
+    if (mailMatch) {
+      appendOutput('mail', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://mail.google.com/');
+      return;
+    }
+    if (outlookMatch) {
+      appendOutput('outlook', []);
+      input.value = '';
+      hideTabOptions();
+      navigateTo('https://outlook.office.com/mail/?culture=en-us&country=us');
+      return;
+    }
+    var singleHex = /^color\s+#([0-9a-fA-F]{6})\s*$/.exec(raw);
+    var radiusOnlyMatch = /^radius\s*$/.exec(raw);
+    var forceOnlyMatch = /^force\s*$/.exec(raw);
+    var radiusMatch = /^radius\s+(\d+)\s*$/.exec(raw);
+    var resetMatch = /^color\s+reset\s*$/.exec(raw);
+    var defaultMatch = /^color\s+default\s*$/.exec(raw);
+    var colorLsMatch = /^color\s+-ls\s*$/.exec(raw);
+    var colorNameMatch = /^color\s+(\w+)\s*$/.exec(raw);
+    var gradientMatch = /^color\s+gradient\s+#([0-9a-fA-F]{6})\s+#([0-9a-fA-F]{6})\s+#([0-9a-fA-F]{6})\s*$/.exec(raw);
+    var distortMatch = /^distort\s*(\d*)\s*$/.exec(raw);
+    var forceMatch = /^force\s+(\d+)\s*$/.exec(raw);
+    var echoMatch = /^echo\s+(.*)\s*$/.exec(raw);
+    var defMatch = /^def\s+(.+)$/.exec(raw);
+    if (defMatch) {
+      var word = defMatch[1].trim().replace(/\s+/g, '-');
+      if (!word) {
+        appendOutput(raw, ['def: usage: def <word>']);
+      } else {
+        var defUrl = 'https://www.merriam-webster.com/dictionary/' + encodeURIComponent(word);
+        var title = 'Dictionary: ' + word;
+        var box = document.createElement('div');
+        box.style.cssText = 'flex:1;min-height:0;margin:-16px;padding:0;overflow:hidden;display:flex;flex-direction:column;';
+        var iframe = document.createElement('iframe');
+        iframe.src = defUrl;
+        iframe.style.cssText = 'flex:1;width:100%;border:none;min-height:0;display:block;';
+        box.appendChild(iframe);
+        createPopupWindow(title, box, null, { width: 700, height: 600, minW: 400, minH: 300 });
+        appendOutput(raw, ['Opened in popup.']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (echoMatch) {
+      appendOutput(raw, [echoMatch[1]]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var calcMatch = /^calc\s+(.+)$/.exec(raw);
+    if (calcMatch) {
+      var ex = calcMatch[1].trim();
+      var val = safeEvalExpr(ex);
+      if (val === null || val === undefined) {
+        appendOutput(raw, ['Invalid expression']);
+      } else {
+        appendOutput(raw, [String(val)]);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var convertMatch = /^convert\s+([\d.-]+)\s+(\S+)\s+(\S+)\s*$/.exec(raw);
+    var convertToMatch = /^convert\s+([\d.-]+)\s+(\S+)\s+to\s+(\S+)\s*$/.exec(raw);
+    if (convertToMatch) {
+      var conv = convertUnits(convertToMatch[1], convertToMatch[2], convertToMatch[3]);
+      if (conv === null) {
+        appendOutput(raw, ['Cannot convert those units. Use length (m, km, cm, mi, ft, in), mass (kg, g, lb, oz), temp (C, F, K), or time (s, min, h, d, week, year).']);
+      } else {
+        appendOutput(raw, [convertToMatch[1] + ' ' + convertToMatch[2] + ' = ' + conv + ' ' + convertToMatch[3]]);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (convertMatch) {
+      var conv = convertUnits(convertMatch[1], convertMatch[2], convertMatch[3]);
+      if (conv === null) {
+        appendOutput(raw, ['Cannot convert those units. Use length (m, km, cm, mi, ft, in), mass (kg, g, lb, oz), temp (C, F, K), or time (s, min, h, d, week, year).']);
+      } else {
+        appendOutput(raw, [convertMatch[1] + ' ' + convertMatch[2] + ' = ' + conv + ' ' + convertMatch[3]]);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var solveMatch = /^solve\s+(.+)$/.exec(raw);
+    if (solveMatch) {
+      var parts = solveMatch[1].trim().split(/\s+/);
+      if (parts.length >= 3) {
+        var a = parseFloat(parts[0]), b = parseFloat(parts[1]), c = parseFloat(parts[2]);
+        var roots = solveQuadratic(a, b, c);
+        if (roots === null) {
+          appendOutput(raw, ['Invalid coefficients']);
+        } else if (roots.length === 0) {
+          appendOutput(raw, ['No real roots']);
+        } else if (roots.length === 1) {
+          appendOutput(raw, ['x = ' + roots[0]]);
+        } else {
+          appendOutput(raw, ['x = ' + roots[0] + ', ' + roots[1]]);
+        }
+      } else {
+        appendOutput(raw, ['Usage: solve a b c  (for ax² + bx + c = 0)']);
+      }
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var primeMatch = /^prime\s+(\d+)\s*$/.exec(raw);
+    if (primeMatch) {
+      var num = parseInt(primeMatch[1], 10);
+      appendOutput(raw, [num + ' is ' + (isPrime(num) ? 'prime' : 'not prime')]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var divMatch = /^(?:div|divisor)\s+(\d+)\s*$/.exec(raw);
+    if (divMatch) {
+      var divs = getDivisors(parseInt(divMatch[1], 10));
+      appendOutput(raw, [divs.length ? divs.join(', ') : 'none']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var gcdMatch = /^gcd\s+(\d+)\s+(\d+)\s*$/.exec(raw);
+    if (gcdMatch) {
+      var g = gcd(parseInt(gcdMatch[1], 10), parseInt(gcdMatch[2], 10));
+      appendOutput(raw, ['gcd = ' + g]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    var lcmMatch = /^lcm\s+(\d+)\s+(\d+)\s*$/.exec(raw);
+    if (lcmMatch) {
+      var l = lcm(parseInt(lcmMatch[1], 10), parseInt(lcmMatch[2], 10));
+      appendOutput(raw, ['lcm = ' + l]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (singleHex && window.updateParticleColors) {
+      appendOutput(raw, []);
+      window.updateParticleColors('single', '#' + singleHex[1]);
+      appendOutput('color #' + singleHex[1], []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (radiusOnlyMatch && typeof window.getParticleRadius === 'function') {
+      appendOutput('radius', [String(window.getParticleRadius())]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (forceOnlyMatch && typeof window.getParticleForce === 'function') {
+      appendOutput('force', [String(window.getParticleForce())]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (radiusMatch) {
+      var r = parseInt(radiusMatch[1], 10);
+      if (!isNaN(r) && r >= 0 && window.setParticleRadius) {
+        window.setParticleRadius(r);
+      }
+      appendOutput(raw, [!isNaN(r) && r >= 0 ? 'Radius set to ' + r : '']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (resetMatch && window.updateParticleColors) {
+      appendOutput(raw, []);
+      window.updateParticleColors('reset');
+      appendOutput('color reset', []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (colorLsMatch) {
+      var names = (window.PARTICLE_PALETTE_NAMES || []).slice().sort();
+      appendOutput(raw, [
+        'Named palettes: ' + names.join(', '),
+        'Other: reset, default, gradient #hex #hex #hex, #rrggbb'
+      ]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (defaultMatch && window.updateParticleColors) {
+      appendOutput(raw, []);
+      window.updateParticleColors('default');
+      appendOutput('color default', []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (colorNameMatch && window.PARTICLE_PALETTE_NAMES && window.PARTICLE_PALETTE_NAMES.indexOf(colorNameMatch[1].toLowerCase()) >= 0 && window.updateParticleColors) {
+      var name = colorNameMatch[1].toLowerCase();
+      appendOutput(raw, []);
+      window.updateParticleColors(name);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (distortMatch) {
+      var dVal = distortMatch[1] !== '' ? parseInt(distortMatch[1], 10) : 12;
+      if (!isNaN(dVal) && window.setParticleForce) {
+        window.setParticleForce(dVal);
+      }
+      appendOutput(raw, [!isNaN(dVal) ? 'Force set to ' + dVal : '']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (forceMatch) {
+      var fVal = parseInt(forceMatch[1], 10);
+      if (!isNaN(fVal) && window.setParticleForce) {
+        window.setParticleForce(fVal);
+      }
+      appendOutput(raw, [!isNaN(fVal) ? 'Force set to ' + fVal : '']);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    if (gradientMatch && window.updateParticleColors) {
+      appendOutput(raw, []);
+      window.updateParticleColors('gradient', '#' + gradientMatch[1], '#' + gradientMatch[2], '#' + gradientMatch[3]);
+      appendOutput('color gradient #' + gradientMatch[1] + ' #' + gradientMatch[2] + ' #' + gradientMatch[3], []);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    appendOutput(raw, []);
+    input.value = raw;
+    var urlMatch = /^https?:\/\/\S+/.exec(raw);
+    if (urlMatch) {
+      navigateTo(urlMatch[0]);
+      input.value = '';
+      hideTabOptions();
+      return;
+    }
+    submitSearchForm();
+  });
+
+  function updateTitlebarDimensions() {
+    var r = win.getBoundingClientRect();
+    var charW = 8;
+    var lineH = 20;
+    var cols = Math.max(10, Math.floor((r.width - 36) / charW));
+    var rows = Math.max(5, Math.floor((r.height - 120) / lineH));
+    titlebar.textContent = 'yashjain - -ysh - ' + cols + '\u00d7' + rows;
+  }
+
+  function initPosition() {
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    var w = Math.min(1000, vw - 40);
+    var h = Math.min(500, vh - 40);
+    wrapper.style.left = Math.max(20, (vw - w) / 2) + 'px';
+    wrapper.style.top = Math.max(20, (vh - h) / 2) + 'px';
+    wrapper.style.transform = 'none';
+    win.style.width = w + 'px';
+    win.style.height = h + 'px';
+    updateTitlebarDimensions();
+  }
+
+  titlebar.addEventListener('mousedown', function(e) {
+    e.preventDefault();
+    var r = wrapper.getBoundingClientRect();
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    dragStartLeft = r.left;
+    dragStartTop = r.top;
+    function move(e) {
+      var dx = e.clientX - dragStartX;
+      var dy = e.clientY - dragStartY;
+      wrapper.style.left = Math.max(0, dragStartLeft + dx) + 'px';
+      wrapper.style.top = Math.max(0, dragStartTop + dy) + 'px';
+    }
+    function stop() {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', stop);
+    }
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', stop);
+  });
+
+  resizeHandle.addEventListener('mousedown', function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var r = win.getBoundingClientRect();
+    resizeStartX = e.clientX;
+    resizeStartY = e.clientY;
+    resizeStartW = r.width;
+    resizeStartH = r.height;
+    function move(e) {
+      var dw = e.clientX - resizeStartX;
+      var dh = e.clientY - resizeStartY;
+      var newW = Math.max(minW, resizeStartW + dw);
+      var newH = Math.max(minH, resizeStartH + dh);
+      win.style.width = newW + 'px';
+      win.style.height = newH + 'px';
+      updateTitlebarDimensions();
+    }
+    function stop() {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', stop);
+    }
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', stop);
+  });
+
+  initPosition();
+  if (input) input.focus();
+  window.addEventListener('resize', function() {
+    var r = wrapper.getBoundingClientRect();
+    if (r.left + r.width > window.innerWidth || r.top + r.height > window.innerHeight) {
+      initPosition();
+    }
+  });
+})();
