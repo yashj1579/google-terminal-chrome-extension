@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>New Tab</title>
   <link rel="icon" type="image/png" href="assets/custom_google_favicon.png">
+  <script src="js/focus-boot.js"></script>
   <style>
     *{box-sizing:border-box}
     html,body{margin:0;padding:0;height:100%;width:100%;background:#1a1a1a}
@@ -38,19 +39,10 @@
       .terminal-input{font-size:15px;height:26px}
     }
   </style>
-  <!-- Relative path inside the extension package (not /assets/css/ from a website root) -->
   <link rel="stylesheet" href="assets/frontpage.css">
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
 </head>
 <body class="google-only">
-  <!--
-    BROKEN: google.html started with Jekyll front matter:
-      ---
-      layout: newtab
-      permalink: /google/
-      ---
-    That only works when built by Jekyll into a static site. Here the markup is the page.
-  -->
   <div class="initial-content" style="padding:0;margin:0;max-width:none">
     <div class="google-page-full">
       <canvas id="google-particle-canvas" class="google-particle-canvas"></canvas>

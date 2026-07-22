@@ -2780,6 +2780,7 @@
   });
 
   initPosition();
+
   function focusTerminalInput() {
     if (!input) return;
     var active = document.activeElement;
@@ -2801,16 +2802,18 @@
   focusTerminalInput();
   window.addEventListener('focus', focusTerminalInput);
   window.addEventListener('pageshow', focusTerminalInput);
-  document.addEventListener('visibilitychange', function() {
+  document.addEventListener('visibilitychange', function () {
     if (!document.hidden) focusTerminalInput();
   });
   var focusTries = 0;
-  var focusTimer = setInterval(function() {
-    focusTerminalInput();
-    if (++focusTries >= 40) clearInterval(focusTimer);
+  var focusTimer = setInterval(function () {
+    if (!document.activeElement || document.activeElement === document.body || document.activeElement === document.documentElement) {
+      focusTerminalInput();
+    }
+    if (++focusTries >= 60) clearInterval(focusTimer);
   }, 50);
 
-  document.addEventListener('mousedown', function(e) {
+  document.addEventListener('mousedown', function (e) {
     if (!input) return;
     if (e.target.closest && e.target.closest('.popup-wrapper, .popup-window, a, button, input, textarea, select, [contenteditable="true"]')) {
       return;
@@ -2818,7 +2821,7 @@
     setTimeout(focusTerminalInput, 0);
   });
 
-  window.addEventListener('resize', function() {
+  window.addEventListener('resize', function () {
     var r = wrapper.getBoundingClientRect();
     if (r.left + r.width > window.innerWidth || r.top + r.height > window.innerHeight) {
       initPosition();
